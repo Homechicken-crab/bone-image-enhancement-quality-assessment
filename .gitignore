@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+dist/
+build/
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+
+# User experiment projects and generated exports
+projects/
+exports/
+evaluations/
+
