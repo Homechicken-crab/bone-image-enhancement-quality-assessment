@@ -120,9 +120,9 @@ class CompatibilityAndPersistenceTest(unittest.TestCase):
         app._selected_roi_id = weak.id
         app._selected_recommendation_id = None
         labels = app._short_roi_labels([weak, neighbor, background])
-        self.assertEqual(labels[weak.id], "W1")
-        self.assertEqual(labels[neighbor.id], "N1")
-        self.assertEqual(labels[background.id], "BG1")
+        self.assertEqual(labels[weak.id], "弱骨1")
+        self.assertEqual(labels[neighbor.id], "邻域1")
+        self.assertEqual(labels[background.id], "背景1")
         self.assertEqual(app._linked_highlight_ids([weak, neighbor, background]), {weak.id, neighbor.id})
 
     def test_uint16_recommendations_are_dynamic_and_in_bounds(self):

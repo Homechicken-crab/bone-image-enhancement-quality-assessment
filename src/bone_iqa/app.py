@@ -18,11 +18,12 @@ from .validation import validate_project
 
 IMAGE_TYPES = [("灰度图像", "*.bmp *.png *.tif *.tiff"), ("所有文件", "*.*")]
 ROI_LABELS = {
-    "weak_bone": "Weak Bone",
-    "strong_bone": "Strong Bone",
-    "surrounding": "Surrounding",
-    "background": "Background",
+    "weak_bone": "弱骨骼",
+    "strong_bone": "强骨骼",
+    "surrounding": "邻域",
+    "background": "背景",
 }
+ROI_TYPES_BY_LABEL = {label: roi_type for roi_type, label in ROI_LABELS.items()}
 ROI_COLORS = {
     "weak_bone": "#ffd54f",
     "strong_bone": "#ef5350",
@@ -168,18 +169,20 @@ class BoneIQAApp(tk.Tk):
         form.pack(fill="x")
         self.roi_name_var = tk.StringVar()
         self.roi_type_var = tk.StringVar(value="weak_bone")
+        self.roi_type_display_var = tk.StringVar(value=ROI_LABELS["weak_bone"])
         self.roi_pair_var = tk.StringVar()
         self.roi_coord_vars = {key: tk.StringVar(value="0") for key in ("x", "y", "width", "height")}
         ttk.Label(form, text="名称").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(form, textvariable=self.roi_name_var, width=28).grid(row=0, column=1, columnspan=3, sticky="ew", pady=3)
         ttk.Label(form, text="类型").grid(row=1, column=0, sticky="w", pady=3)
-        self.roi_type_combo = ttk.Combobox(form, textvariable=self.roi_type_var, values=list(ROI_LABELS), state="readonly", width=25)
+        self.roi_type_combo = ttk.Combobox(form, textvariable=self.roi_type_display_var, values=list(ROI_LABELS.values()), state="readonly", width=25)
         self.roi_type_combo.grid(row=1, column=1, columnspan=3, sticky="ew", pady=3)
+        self.roi_type_combo.bind("<<ComboboxSelected>>", self._roi_type_display_changed)
         labels = ("x", "y", "width", "height")
         for index, key in enumerate(labels):
             ttk.Label(form, text=key).grid(row=2 + index // 2, column=(index % 2) * 2, sticky="w", pady=3)
             ttk.Entry(form, textvariable=self.roi_coord_vars[key], width=9).grid(row=2 + index // 2, column=(index % 2) * 2 + 1, sticky="ew", padx=(2, 8), pady=3)
-        ttk.Label(form, text="Surrounding 配对").grid(row=4, column=0, sticky="w", pady=3)
+        ttk.Label(form, text="邻域配对").grid(row=4, column=0, sticky="w", pady=3)
         self.roi_pair_combo = ttk.Combobox(form, textvariable=self.roi_pair_var, state="readonly", width=25)
         self.roi_pair_combo.grid(row=4, column=1, columnspan=3, sticky="ew", pady=3)
         form.columnconfigure(1, weight=1)
@@ -380,6 +383,7 @@ class BoneIQAApp(tk.Tk):
         self._selected_recommendation_id = None
         self.roi_name_var.set("")
         self.roi_type_var.set("weak_bone")
+        self.roi_type_display_var.set(ROI_LABELS["weak_bone"])
         self.roi_pair_var.set("")
         for variable in self.roi_coord_vars.values():
             variable.set("0")
@@ -404,12 +408,16 @@ class BoneIQAApp(tk.Tk):
     def _populate_roi_form(self, roi: ROI):
         self.roi_name_var.set(roi.name)
         self.roi_type_var.set(roi.type)
+        self.roi_type_display_var.set(ROI_LABELS[roi.type])
         for key, value in zip(("x", "y", "width", "height"), roi.geometry()):
             self.roi_coord_vars[key].set(str(value))
         all_rois = list(self.store.project.rois) if self.store else []
         all_rois.extend(item.roi for item in self.roi_recommendations)
         pair = next((item for item in all_rois if item.id == roi.paired_surrounding_roi_id), None)
         self.roi_pair_var.set(f"{pair.name} | {pair.id}" if pair else "")
+
+    def _roi_type_display_changed(self, _event=None):
+        self.roi_type_var.set(ROI_TYPES_BY_LABEL[self.roi_type_display_var.get()])
 
     def _recommendation_selected(self, _event=None):
         selection = self.recommendation_tree.selection()
@@ -451,7 +459,7 @@ class BoneIQAApp(tk.Tk):
             if roi.type in {"weak_bone", "strong_bone"} and not roi.paired_surrounding_roi_id:
                 roi.paired_surrounding_roi_id = nearest_surrounding_roi_id(store.project.rois, roi)
             if roi.type in {"weak_bone", "strong_bone"} and not roi.paired_surrounding_roi_id:
-                messagebox.showwarning("CNR 无法计算", "该 Bone ROI 尚未设置 Surrounding ROI，因此 CNR 无法计算。允许保存，但请随后创建或选择 Surrounding ROI。")
+                messagebox.showwarning("CNR 无法计算", "该骨骼 ROI 尚未设置邻域 ROI，因此 CNR 无法计算。允许保存，但请随后创建或选择邻域 ROI。")
             store.upsert_roi(roi)
             if roi.type == "background":
                 image = load_grayscale(store.resolve(store.project.original.relative_path))
@@ -489,12 +497,12 @@ class BoneIQAApp(tk.Tk):
                 counts = {key: sum(1 for item in self.roi_recommendations if item.roi.type == key) for key in ROI_LABELS}
                 unpaired = sum(1 for item in self.roi_recommendations if item.roi.type in {"weak_bone", "strong_bone"} and not item.roi.paired_surrounding_roi_id)
                 message = (
-                    f"已生成：Background {counts['background']}，Strong Bone {counts['strong_bone']}，"
-                    f"Weak Bone {counts['weak_bone']}，Surrounding {counts['surrounding']}。"
+                    f"已生成：背景 {counts['background']}，强骨骼 {counts['strong_bone']}，"
+                    f"弱骨骼 {counts['weak_bone']}，邻域 {counts['surrounding']}。"
                     "所有 Bone 候选均已自动尝试配对。"
                 )
                 if unpaired:
-                    message += f"有 {unpaired} 个 Bone 候选未找到可靠 Surrounding，请人工检查。"
+                    message += f"有 {unpaired} 个骨骼候选未找到可靠邻域，请人工检查。"
                 self._set_status(message)
         except Exception as exc:
             messagebox.showerror("ROI 推荐失败", str(exc))
@@ -547,7 +555,7 @@ class BoneIQAApp(tk.Tk):
                 pair_id = removed.roi.paired_surrounding_roi_id
                 used_elsewhere = any(item.roi.id != removed_id and item.roi.paired_surrounding_roi_id == pair_id for item in self.roi_recommendations)
                 pair_exists = any(item.roi.id == pair_id for item in self.roi_recommendations)
-                remove_neighbor = pair_exists and not used_elsewhere and messagebox.askyesno("删除配对候选", "该 Bone 的 Surrounding 未被其他候选使用，是否一并删除？")
+                remove_neighbor = pair_exists and not used_elsewhere and messagebox.askyesno("删除配对候选", "该骨骼 ROI 的邻域未被其他候选使用，是否一并删除？")
             self.roi_recommendations = remove_recommendation(self.roi_recommendations, removed_id, remove_neighbor)
         else:
             self.roi_recommendations = []
@@ -685,7 +693,7 @@ class BoneIQAApp(tk.Tk):
             f"项目：{project.name}\n"
             f"原图：{project.original.display_name if project.original else '未导入'}\n"
             f"增强方案：{len(project.algorithms)} 个\n"
-            f"ROI：Weak {counts['weak_bone']} / Strong {counts['strong_bone']} / Surrounding {counts['surrounding']} / Background {counts['background']}\n"
+            f"ROI：弱骨骼 {counts['weak_bone']} / 强骨骼 {counts['strong_bone']} / 邻域 {counts['surrounding']} / 背景 {counts['background']}\n"
             f"评价状态：{'已有结果 ' + project.latest_evaluation_id if project.latest_evaluation_id else '尚未评价或结果已失效'}"
         )
 
@@ -759,14 +767,14 @@ class BoneIQAApp(tk.Tk):
                 self._draw_roi(canvas, roi, labels[roi.id], ox, oy, scale, roi.id in highlighted, recommended=False)
             for roi in recommended:
                 self._draw_roi(canvas, roi, labels[roi.id], ox, oy, scale, roi.id in highlighted, recommended=True)
-            legend = "W  Weak Bone    S  Strong Bone    N  Surrounding    BG  Background"
-            canvas.create_rectangle(8, 8, 505, 32, fill="#111", outline="#888")
+            legend = "弱骨骼 ｜ 强骨骼 ｜ 邻域 ｜ 背景"
+            canvas.create_rectangle(8, 8, 315, 32, fill="#111", outline="#888")
             canvas.create_text(16, 20, text=legend, fill="white", anchor="w", font=("Microsoft YaHei UI", 9))
         except Exception as exc:
             canvas.create_text(20, 20, text=f"无法显示原图：{exc}", fill="white", anchor="nw")
 
     def _short_roi_labels(self, rois: list[ROI]) -> dict[str, str]:
-        prefixes = {"weak_bone": "W", "strong_bone": "S", "surrounding": "N", "background": "BG"}
+        prefixes = {"weak_bone": "弱骨", "strong_bone": "强骨", "surrounding": "邻域", "background": "背景"}
         counters = {key: 0 for key in prefixes}
         labels: dict[str, str] = {}
         for roi in rois:
@@ -798,7 +806,17 @@ class BoneIQAApp(tk.Tk):
         if recommended:
             options["dash"] = (6, 4)
         canvas.create_rectangle(x1, y1, x2, y2, **options)
-        canvas.create_text(x1 + 3, y1 + 3, text=label, fill=color, anchor="nw", font=("Microsoft YaHei UI", 10, "bold" if highlighted else "normal"))
+        shown_label = self._canvas_roi_label(label, x2 - x1)
+        canvas.create_text(x1 + 3, y1 + 3, text=shown_label, fill=color, anchor="nw", font=("Microsoft YaHei UI", 10, "bold" if highlighted else "normal"))
+
+    @staticmethod
+    def _canvas_roi_label(label: str, width_pixels: float) -> str:
+        if width_pixels >= 48:
+            return label
+        for long_prefix, short_prefix in (("弱骨", "弱"), ("强骨", "强"), ("邻域", "邻"), ("背景", "背")):
+            if label.startswith(long_prefix):
+                return short_prefix + label[len(long_prefix) :]
+        return label
 
     def _fill_results(self, result):
         self.summary_tree.delete(*self.summary_tree.get_children())

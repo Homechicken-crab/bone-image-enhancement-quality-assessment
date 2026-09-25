@@ -2,7 +2,7 @@
 
 骨骼图像增强质量评价平台是一个面向“光电图像处理课程设计”的本地科研实验工具，用统一 ROI、统一灰度范围和统一指标定义比较原图及多个增强算法结果。
 
-当前版本为 `v0.1.2`，遵循 [指标规范 1.1.1](docs/metric_specification.md)，重点保证正确性、可重复性、实验公平性和后续扩展能力。
+当前版本为 `v0.1.3`，遵循 [指标规范 1.1.1](docs/metric_specification.md)，重点保证正确性、可重复性、实验公平性和后续扩展能力。
 
 ## 已实现
 
@@ -22,8 +22,8 @@
 - 批量评价、总体表、辅助指标表、ROI 表
 - `metrics.csv`、`roi_metrics.csv`、`validation.csv` 和完整 JSON 导出
 - 基于原图的可解释 ROI 自动推荐助手
-- Strong Response Mask、Weak Bone 强响应排除与改进的局部非骨 Surrounding 推荐
-- Canvas 短标签、图例及 Bone–Surrounding 联动高亮
+- Strong Response Mask、有效信号掩膜、弱骨骼结构连续性与局部邻域推荐
+- 中文 ROI 名称、画布短标签、图例及骨骼–邻域联动高亮
 
 ## 安装与运行
 
@@ -98,4 +98,4 @@ python -m unittest discover -s tests -v
 
 ## 项目状态
 
-当前为第一阶段 `v0.1.2`。后续计划包括局部视觉对比、同步缩放、图表、Excel、规则化文字摘要和更多辅助指标。
+当前为第一阶段 `v0.1.3`。后续计划包括局部视觉对比、同步缩放、图表、Excel、规则化文字摘要和更多辅助指标。
