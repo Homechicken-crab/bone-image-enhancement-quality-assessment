@@ -1,4 +1,4 @@
 """Bone Image Enhancement Quality Assessment Tool."""
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 METRIC_SPEC_VERSION = "1.1.1"

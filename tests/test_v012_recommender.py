@@ -120,7 +120,7 @@ class CompatibilityAndPersistenceTest(unittest.TestCase):
         app._selected_roi_id = weak.id
         app._selected_recommendation_id = None
         labels = app._short_roi_labels([weak, neighbor, background])
-        self.assertEqual(labels[weak.id], "弱骨1")
+        self.assertEqual(labels[weak.id], "弱骨骼1")
         self.assertEqual(labels[neighbor.id], "邻域1")
         self.assertEqual(labels[background.id], "背景1")
         self.assertEqual(app._linked_highlight_ids([weak, neighbor, background]), {weak.id, neighbor.id})

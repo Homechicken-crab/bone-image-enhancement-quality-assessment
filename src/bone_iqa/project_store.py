@@ -193,6 +193,12 @@ class ProjectStore:
         self.project.latest_evaluation_id = None
         self.save()
 
+    def clear_rois(self) -> None:
+        """Remove every saved ROI and invalidate the latest evaluation."""
+        self.project.rois.clear()
+        self.project.latest_evaluation_id = None
+        self.save()
+
     def save_evaluation(self, evaluation: dict[str, Any]) -> Path:
         path = self.root / "evaluations/latest.json"
         _atomic_json_write(path, evaluation)

@@ -28,16 +28,15 @@ class ChineseUiAndCompatibilityTest(unittest.TestCase):
             ROI.create("d", "background", 24, 0, 8, 8),
         ]
         app = object.__new__(BoneIQAApp)
-        self.assertEqual(list(app._short_roi_labels(rois).values()), ["弱骨1", "强骨1", "邻域1", "背景1"])
-        self.assertEqual(app._canvas_roi_label("弱骨1", 30), "弱1")
-        self.assertEqual(app._canvas_roi_label("弱骨1", 60), "弱骨1")
+        self.assertEqual(list(app._short_roi_labels(rois).values()), ["弱骨骼1", "强骨骼1", "邻域1", "背景1"])
         self.assertEqual([roi.type for roi in rois], ["weak_bone", "strong_bone", "surrounding", "background"])
 
     def test_recommended_names_do_not_contain_recommendation_marker(self):
         recommendations = recommend_rois(synthetic_body_image())
         self.assertTrue(recommendations)
         self.assertTrue(all("推荐" not in item.roi.name for item in recommendations))
-        self.assertTrue(any(item.roi.name.startswith("弱骨") for item in recommendations))
+        self.assertTrue(any(item.roi.name.startswith("弱骨骼") for item in recommendations))
+        self.assertTrue(any(item.roi.name.startswith("强骨骼") for item in recommendations))
         self.assertTrue(any(item.roi.name.endswith("-邻域") for item in recommendations if item.roi.type == "surrounding"))
 
 

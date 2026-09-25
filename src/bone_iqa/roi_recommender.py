@@ -144,7 +144,7 @@ def recommend_rois(
         roi = ROI.create(f"背景{index}", "background", candidate.x, candidate.y, candidate.width, candidate.height)
         recommendations.append(ROIRecommendation(roi, candidate.score, "推荐", _background_explanation(candidate)))
 
-    for roi_type, candidates, label in (("strong_bone", strong, "强骨"), ("weak_bone", weak, "弱骨")):
+    for roi_type, candidates, label in (("strong_bone", strong, "强骨骼"), ("weak_bone", weak, "弱骨骼")):
         for index, candidate in enumerate(candidates, 1):
             bone = ROI.create(f"{label}{index}", roi_type, candidate.x, candidate.y, candidate.width, candidate.height)
             neighbor = _recommend_surrounding(

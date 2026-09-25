@@ -192,6 +192,7 @@ class BoneIQAApp(tk.Tk):
         ttk.Button(buttons, text="保存 ROI", command=self.save_roi).pack(side="left", padx=2)
         ttk.Button(buttons, text="删除", command=self.delete_roi).pack(side="left", padx=2)
         ttk.Button(buttons, text="显示/隐藏", command=self.toggle_roi).pack(side="left", padx=2)
+        ttk.Button(right, text="清空已保存 ROI", command=self.clear_saved_rois).pack(fill="x", pady=(0, 8))
 
     def _build_evaluation(self):
         toolbar = ttk.Frame(self.evaluate_tab, padding=8)
@@ -572,6 +573,28 @@ class BoneIQAApp(tk.Tk):
             self.clear_roi_form()
             self.refresh_all()
 
+    def clear_saved_rois(self):
+        store = self._require_store()
+        if not store:
+            return
+        count = len(store.project.rois)
+        if count == 0:
+            messagebox.showinfo("清空已保存 ROI", "当前没有已保存的 ROI。")
+            return
+        confirmed = messagebox.askokcancel(
+            "清空已保存 ROI",
+            "确定清空当前项目中的全部已保存 ROI 吗？\n\n"
+            "将删除：\n弱骨骼、强骨骼、邻域和背景 ROI。\n\n"
+            "已有评价结果将失效。\n"
+            "此操作不会删除尚未接受的推荐候选。",
+        )
+        if not confirmed:
+            return
+        store.clear_rois()
+        self.clear_roi_form()
+        self.refresh_all()
+        self._set_status(f"已清空全部已保存 ROI，共删除 {count} 个。")
+
     def toggle_roi(self):
         store = self._require_store()
         if not store or not self._selected_roi_id:
@@ -774,7 +797,7 @@ class BoneIQAApp(tk.Tk):
             canvas.create_text(20, 20, text=f"无法显示原图：{exc}", fill="white", anchor="nw")
 
     def _short_roi_labels(self, rois: list[ROI]) -> dict[str, str]:
-        prefixes = {"weak_bone": "弱骨", "strong_bone": "强骨", "surrounding": "邻域", "background": "背景"}
+        prefixes = {"weak_bone": "弱骨骼", "strong_bone": "强骨骼", "surrounding": "邻域", "background": "背景"}
         counters = {key: 0 for key in prefixes}
         labels: dict[str, str] = {}
         for roi in rois:
@@ -806,17 +829,7 @@ class BoneIQAApp(tk.Tk):
         if recommended:
             options["dash"] = (6, 4)
         canvas.create_rectangle(x1, y1, x2, y2, **options)
-        shown_label = self._canvas_roi_label(label, x2 - x1)
-        canvas.create_text(x1 + 3, y1 + 3, text=shown_label, fill=color, anchor="nw", font=("Microsoft YaHei UI", 10, "bold" if highlighted else "normal"))
-
-    @staticmethod
-    def _canvas_roi_label(label: str, width_pixels: float) -> str:
-        if width_pixels >= 48:
-            return label
-        for long_prefix, short_prefix in (("弱骨", "弱"), ("强骨", "强"), ("邻域", "邻"), ("背景", "背")):
-            if label.startswith(long_prefix):
-                return short_prefix + label[len(long_prefix) :]
-        return label
+        canvas.create_text(x1 + 3, y1 + 3, text=label, fill=color, anchor="nw", font=("Microsoft YaHei UI", 10, "bold" if highlighted else "normal"))
 
     def _fill_results(self, result):
         self.summary_tree.delete(*self.summary_tree.get_children())
