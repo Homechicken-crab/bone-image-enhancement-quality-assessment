@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.2
+
+- 新增基于非零灰度动态分位数、局部梯度与邻域连通性的 Strong Response Mask，并生成膨胀排除区。
+- Weak Bone 改用中等响应、梯度、边缘密度、局部对比和方差组合评分，显式排除强响应区域。
+- Weak Bone 候选同时使用最小中心距离和 IoU 抑制，并以距离奖励改善空间覆盖。
+- Surrounding 不再奖励与 Bone 灰度接近，改为优先选择灰度较低但非纯背景的局部非骨参考区。
+- Surrounding 增加强响应、高灰度比例、边缘密度与梯度抑制，并扩展到有限的四个对角候选。
+- 推荐候选增加“推荐 / 需检查”质量提示。
+- Canvas 使用 W、S、N、BG 短标签和图例，并联动高亮 Bone–Surrounding 配对。
+- 删除推荐 Surrounding 时立即清除 Bone 的悬空配对；删除 Bone 时可同时删除未共享的推荐 Surrounding。
+- 自动推荐状态栏增加分类统计和未配对提示。
+- 新增 Strong 排除、空间分散、Surrounding 有效性、uint16、双投影和配对持久化测试。
+
 ## v0.1.1
 
 - 重写 Windows `run.bat`，使用 ASCII 与 CRLF，并在失败时保留窗口和退出码。

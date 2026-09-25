@@ -5,7 +5,7 @@ from typing import Iterable
 
 import numpy as np
 
-from .metrics import EPSILON, average_gradient, roi_statistics
+from .metrics import EPSILON, roi_statistics
 from .models import ROI
 
 
@@ -25,10 +25,14 @@ class _Candidate:
     height: int
     score: float
     mean: float
+    signal_mean: float
     std: float
     gradient: float
     unique: int
     nonzero_fraction: float
+    edge_density: float
+    high_fraction: float
+    strong_overlap: float
 
 
 def recommend_rois(
@@ -37,11 +41,12 @@ def recommend_rois(
     max_strong: int = 2,
     max_weak: int = 4,
 ) -> list[ROIRecommendation]:
-    """Recommend explainable rectangle ROIs from the original image only.
+    """Generate reviewable rectangle candidates from the original image only.
 
-    Scores combine local intensity, standard deviation, gradient, contrast and
-    spatial separation. Recommendations are candidates requiring user review;
-    they are not anatomical segmentation or diagnosis.
+    This is an explainable image-processing heuristic, not anatomical
+    segmentation. Strong response is estimated from dynamic percentiles;
+    Weak Bone candidates are required to contain structure while avoiding the
+    dilated strong-response exclusion mask.
     """
     image = np.asarray(original)
     if image.ndim != 2 or min(image.shape) < 16:
@@ -50,22 +55,32 @@ def recommend_rois(
     height, width = values.shape
     dtype_max = float(np.iinfo(image.dtype).max) if np.issubdtype(image.dtype, np.integer) else max(float(values.max()), 1.0)
     positive = values[values > 0]
-    robust_high = float(np.percentile(positive, 95)) if positive.size else dtype_max
-    robust_high = max(robust_high, dtype_max * 0.02, 1.0)
+    if positive.size < 8:
+        return []
+    robust_high = max(float(np.percentile(positive, 95)), dtype_max * 0.02, 1.0)
+    weak_low = float(np.percentile(positive, 20))
+    weak_high = float(np.percentile(positive, 68))
+    high_threshold = float(np.percentile(positive, 80))
 
     gradient_map = _gradient_map(values)
-    grad_scale = max(float(np.percentile(gradient_map, 95)), 1.0)
+    positive_gradients = gradient_map[values > 0]
+    grad_scale = max(float(np.percentile(positive_gradients, 90)), 1.0)
+    edge_threshold = max(float(np.percentile(positive_gradients, 62)), EPSILON)
+    edge_mask = gradient_map >= edge_threshold
+    strong_mask, strong_exclusion_mask = build_strong_response_masks(values, gradient_map)
+
     bg_w = _bounded_size(width, 0.10)
     bg_h = _bounded_size(height, 0.07)
     bone_w = _bounded_size(width, 0.12)
     bone_h = _bounded_size(height, 0.08)
 
+    # Background logic intentionally remains conservative and unchanged in spirit.
     background_pool: list[_Candidate] = []
     for x, y in _grid(width, height, bg_w, bg_h):
         border = x < width * 0.28 or x + bg_w > width * 0.72 or y < height * 0.22 or y + bg_h > height * 0.88
         if not border:
             continue
-        candidate = _describe(values, gradient_map, x, y, bg_w, bg_h)
+        candidate = _describe(values, gradient_map, edge_mask, strong_mask, high_threshold, x, y, bg_w, bg_h)
         if candidate.std <= EPSILON or candidate.unique < 3 or candidate.mean <= 0:
             continue
         mean_norm = min(candidate.mean / robust_high, 1.0)
@@ -77,36 +92,46 @@ def recommend_rois(
         edge_bonus = 1.0 - min(max(border_distance, 0) / max(min(width, height) * 0.25, 1.0), 1.0)
         candidate.score = 0.35 * (1.0 - mean_norm) + 0.25 * (1.0 - grad_norm) + 0.25 * variance_quality + 0.15 * edge_bonus
         background_pool.append(candidate)
-    backgrounds = _select_spread(background_pool, max_background, width, height, min_distance=0.22)
+    backgrounds = _select_spread(background_pool, max_background, width, height, min_distance=0.20, max_iou=0.05)
 
-    high_threshold = float(np.percentile(positive, 72)) if positive.size else robust_high
     strong_pool: list[_Candidate] = []
     weak_pool: list[_Candidate] = []
     for x, y in _grid(width, height, bone_w, bone_h):
-        candidate = _describe(values, gradient_map, x, y, bone_w, bone_h)
-        region = values[y : y + bone_h, x : x + bone_w]
-        high_fraction = float(np.mean(region >= high_threshold)) if region.size else 0.0
-        mean_norm = min(candidate.mean / robust_high, 1.0)
+        candidate = _describe(values, gradient_map, edge_mask, strong_mask, high_threshold, x, y, bone_w, bone_h)
+        signal_norm = min(candidate.signal_mean / robust_high, 1.0)
         grad_norm = min(candidate.gradient / grad_scale, 1.0)
-        if candidate.nonzero_fraction >= 0.10 and candidate.unique >= 3:
-            candidate.score = 0.50 * mean_norm + 0.30 * high_fraction + 0.20 * grad_norm
-            if mean_norm >= 0.32 or high_fraction >= 0.20:
-                strong_pool.append(candidate)
 
+        if candidate.nonzero_fraction >= 0.10 and candidate.unique >= 3 and candidate.strong_overlap >= 0.04:
+            candidate.score = 0.45 * signal_norm + 0.30 * candidate.strong_overlap + 0.15 * candidate.high_fraction + 0.10 * grad_norm
+            strong_pool.append(candidate)
+
+        exclusion_overlap = float(np.mean(strong_exclusion_mask[y : y + bone_h, x : x + bone_w]))
+        if exclusion_overlap > 0.18 or candidate.nonzero_fraction < 0.08 or candidate.unique < 3:
+            continue
+        moderate_intensity = _moderate_intensity_score(candidate.signal_mean, weak_low, weak_high, robust_high)
         expanded = _expanded_region(values, x, y, bone_w, bone_h)
-        surrounding_mean = float(np.mean(expanded)) if expanded.size else candidate.mean
-        contrast = min(abs(candidate.mean - surrounding_mean) / robust_high, 1.0)
-        middle_intensity = max(0.0, 1.0 - abs(mean_norm - 0.38) / 0.38)
-        background_penalty = 1.0 if candidate.nonzero_fraction < 0.08 or candidate.unique < 3 else 0.0
-        strong_penalty = max(0.0, (mean_norm - 0.68) / 0.32)
-        candidate_weak = _Candidate(**{**candidate.__dict__})
-        candidate_weak.score = 0.30 * middle_intensity + 0.35 * grad_norm + 0.25 * contrast + 0.10 * min(candidate.std / robust_high * 8.0, 1.0) - 0.55 * background_penalty - 0.35 * strong_penalty
-        if candidate_weak.score > 0.12 and candidate.nonzero_fraction >= 0.08 and candidate.unique >= 3:
-            weak_pool.append(candidate_weak)
+        surrounding_mean = _ring_mean(expanded, values[y : y + bone_h, x : x + bone_w])
+        local_contrast = min(abs(candidate.mean - surrounding_mean) / robust_high, 1.0)
+        variance_score = min(candidate.std / max(robust_high * 0.12, 1.0), 1.0)
+        background_penalty = max(0.0, (0.18 - candidate.nonzero_fraction) / 0.18)
+        strong_penalty = min(exclusion_overlap / 0.18, 1.0) + max(0.0, (candidate.signal_mean - weak_high) / max(robust_high - weak_high, 1.0))
+        texture_penalty = max(0.0, (candidate.edge_density - 0.58) / 0.42) * max(0.0, 1.0 - local_contrast)
+        candidate.score = (
+            0.25 * moderate_intensity
+            + 0.30 * grad_norm
+            + 0.20 * candidate.edge_density
+            + 0.20 * local_contrast
+            + 0.05 * variance_score
+            - 0.60 * strong_penalty
+            - 0.50 * background_penalty
+            - 0.20 * texture_penalty
+        )
+        if candidate.score > 0.16 and candidate.edge_density >= 0.025:
+            weak_pool.append(candidate)
 
-    strong = _select_spread(strong_pool, max_strong, width, height, min_distance=0.20)
-    weak_pool = [candidate for candidate in weak_pool if not any(_iou(candidate, item) > 0.12 for item in strong)]
-    weak = _select_spread(weak_pool, max_weak, width, height, min_distance=0.16)
+    strong = _select_spread(strong_pool, max_strong, width, height, min_distance=0.17, max_iou=0.10)
+    weak_pool = [candidate for candidate in weak_pool if not any(_iou(candidate, item) > 0.08 for item in strong)]
+    weak = _select_spread(weak_pool, max_weak, width, height, min_distance=0.13, max_iou=0.12)
 
     recommendations: list[ROIRecommendation] = []
     for index, candidate in enumerate(backgrounds, 1):
@@ -116,24 +141,103 @@ def recommend_rois(
     for roi_type, candidates, label in (("strong_bone", strong, "Strong Bone"), ("weak_bone", weak, "Weak Bone")):
         for index, candidate in enumerate(candidates, 1):
             bone = ROI.create(f"推荐 {label} {index}", roi_type, candidate.x, candidate.y, candidate.width, candidate.height)
-            surrounding_candidate = _recommend_surrounding(values, gradient_map, candidate, robust_high, grad_scale)
-            if surrounding_candidate is not None:
-                surrounding = ROI.create(
-                    f"{bone.name}-周围", "surrounding", surrounding_candidate.x, surrounding_candidate.y,
-                    surrounding_candidate.width, surrounding_candidate.height,
+            neighbor = _recommend_surrounding(
+                values, gradient_map, edge_mask, strong_mask, high_threshold,
+                candidate, robust_high, grad_scale,
+            )
+            if neighbor is not None:
+                surrounding, quality, explanation = neighbor
+                surrounding_roi = ROI.create(
+                    f"{bone.name}-周围", "surrounding", surrounding.x, surrounding.y,
+                    surrounding.width, surrounding.height,
                 )
-                bone.paired_surrounding_roi_id = surrounding.id
-                recommendations.append(ROIRecommendation(
-                    surrounding, surrounding_candidate.score, "推荐",
-                    "相邻矩形；不与 Bone ROI 重叠；优先保留非恒定、较低梯度且仍含有效信号的区域。",
-                ))
+                bone.paired_surrounding_roi_id = surrounding_roi.id
+                recommendations.append(ROIRecommendation(surrounding_roi, surrounding.score, quality, explanation))
             explanation = (
-                f"组合评分={candidate.score:.3f}；局部均值={candidate.mean:.3f}；"
+                f"组合评分={candidate.score:.3f}；局部信号均值={candidate.signal_mean:.3f}；"
                 f"标准差={candidate.std:.3f}；平均梯度={candidate.gradient:.3f}；"
-                f"非零像素比例={candidate.nonzero_fraction:.1%}。"
+                f"边缘密度={candidate.edge_density:.1%}；强响应重叠={candidate.strong_overlap:.1%}。"
             )
             recommendations.append(ROIRecommendation(bone, candidate.score, "推荐", explanation))
     return recommendations
+
+
+def recommend_surrounding_for_roi(original: np.ndarray, bone_roi: ROI) -> ROIRecommendation | None:
+    """Recommend one local non-bone reference rectangle for a supplied Bone ROI."""
+    image = np.asarray(original)
+    if image.ndim != 2 or bone_roi.width <= 0 or bone_roi.height <= 0:
+        return None
+    values = image.astype(np.float64)
+    positive = values[values > 0]
+    if positive.size < 3:
+        return None
+    dtype_max = float(np.iinfo(image.dtype).max) if np.issubdtype(image.dtype, np.integer) else max(float(values.max()), 1.0)
+    robust_high = max(float(np.percentile(positive, 95)), dtype_max * 0.02, 1.0)
+    high_threshold = float(np.percentile(positive, 80))
+    gradient = _gradient_map(values)
+    positive_gradients = gradient[values > 0]
+    grad_scale = max(float(np.percentile(positive_gradients, 90)), 1.0)
+    edge_threshold = max(float(np.percentile(positive_gradients, 62)), EPSILON)
+    edge_mask = gradient >= edge_threshold
+    strong_mask, _ = build_strong_response_masks(values, gradient)
+    bone = _describe(
+        values, gradient, edge_mask, strong_mask, high_threshold,
+        bone_roi.x, bone_roi.y, bone_roi.width, bone_roi.height,
+    )
+    result = _recommend_surrounding(values, gradient, edge_mask, strong_mask, high_threshold, bone, robust_high, grad_scale)
+    if result is None:
+        return None
+    candidate, quality, explanation = result
+    roi = ROI.create(
+        f"{bone_roi.name}-周围", "surrounding", candidate.x, candidate.y,
+        candidate.width, candidate.height,
+    )
+    return ROIRecommendation(roi, candidate.score, quality, explanation)
+
+
+def remove_recommendation(
+    recommendations: list[ROIRecommendation],
+    roi_id: str,
+    remove_orphan_neighbor: bool = False,
+) -> list[ROIRecommendation]:
+    """Remove a candidate and clear dependent pair IDs without leaving dangling links."""
+    removed = next((item for item in recommendations if item.roi.id == roi_id), None)
+    if removed is None:
+        return list(recommendations)
+    result = [item for item in recommendations if item.roi.id != roi_id]
+    if removed.roi.type == "surrounding":
+        for item in result:
+            if item.roi.paired_surrounding_roi_id == roi_id:
+                item.roi.paired_surrounding_roi_id = None
+                item.quality = "需检查"
+                item.explanation += " 对应 Surrounding 已删除，当前未配对。"
+    elif remove_orphan_neighbor and removed.roi.type in {"weak_bone", "strong_bone"} and removed.roi.paired_surrounding_roi_id:
+        pair_id = removed.roi.paired_surrounding_roi_id
+        if not any(item.roi.paired_surrounding_roi_id == pair_id for item in result):
+            result = [item for item in result if item.roi.id != pair_id]
+    return result
+
+
+def build_strong_response_masks(values: np.ndarray, gradient: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Return a coarse strong-response mask and its dilated exclusion mask.
+
+    All connected high-response groups are retained; no largest-component
+    assumption is made, so dual-projection images remain supported.
+    """
+    image = np.asarray(values, dtype=np.float64)
+    gradient_map = _gradient_map(image) if gradient is None else np.asarray(gradient, dtype=np.float64)
+    positive = image[image > 0]
+    if positive.size < 3:
+        empty = np.zeros(image.shape, dtype=bool)
+        return empty, empty.copy()
+    high_threshold = float(np.percentile(positive, 80))
+    gradient_values = gradient_map[image > 0]
+    gradient_threshold = float(np.percentile(gradient_values, 55)) if gradient_values.size else 0.0
+    high = image >= high_threshold
+    neighbors = _neighbor_count(high)
+    strong = high & ((neighbors >= 2) | ((gradient_map >= gradient_threshold) & (neighbors >= 1)))
+    radius = max(1, min(4, int(round(min(image.shape) * 0.012))))
+    return strong, _dilate(strong, radius)
 
 
 def _bounded_size(length: int, fraction: float) -> int:
@@ -162,17 +266,66 @@ def _gradient_map(values: np.ndarray) -> np.ndarray:
     return np.sqrt((dx * dx + dy * dy) / 2.0)
 
 
-def _describe(values: np.ndarray, gradient: np.ndarray, x: int, y: int, width: int, height: int) -> _Candidate:
+def _neighbor_count(mask: np.ndarray) -> np.ndarray:
+    padded = np.pad(mask.astype(np.uint8), 1, mode="constant")
+    result = np.zeros(mask.shape, dtype=np.uint8)
+    height, width = mask.shape
+    for dy in range(3):
+        for dx in range(3):
+            if dx == 1 and dy == 1:
+                continue
+            result += padded[dy : dy + height, dx : dx + width]
+    return result
+
+
+def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    result = mask.astype(bool, copy=True)
+    for _ in range(radius):
+        padded = np.pad(result, 1, mode="constant")
+        expanded = np.zeros_like(result)
+        for dy in range(3):
+            for dx in range(3):
+                expanded |= padded[dy : dy + result.shape[0], dx : dx + result.shape[1]]
+        result = expanded
+    return result
+
+
+def _describe(
+    values: np.ndarray,
+    gradient: np.ndarray,
+    edge_mask: np.ndarray,
+    strong_mask: np.ndarray,
+    high_threshold: float,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+) -> _Candidate:
     region = values[y : y + height, x : x + width]
     stats = roi_statistics(region)
+    nonzero = region[region > 0]
     return _Candidate(
-        x, y, width, height, 0.0,
-        float(stats["mean_intensity"] or 0.0),
-        float(stats["std_intensity"] or 0.0),
-        float(np.mean(gradient[y : y + height, x : x + width])),
-        int(stats["unique_pixel_count"] or 0),
-        float(np.mean(region > 0)) if region.size else 0.0,
+        x=x, y=y, width=width, height=height, score=0.0,
+        mean=float(stats["mean_intensity"] or 0.0),
+        signal_mean=float(np.mean(nonzero)) if nonzero.size else 0.0,
+        std=float(stats["std_intensity"] or 0.0),
+        gradient=float(np.mean(gradient[y : y + height, x : x + width])),
+        unique=int(stats["unique_pixel_count"] or 0),
+        nonzero_fraction=float(np.mean(region > 0)) if region.size else 0.0,
+        edge_density=float(np.mean(edge_mask[y : y + height, x : x + width])),
+        high_fraction=float(np.mean(region >= high_threshold)) if region.size else 0.0,
+        strong_overlap=float(np.mean(strong_mask[y : y + height, x : x + width])),
     )
+
+
+def _moderate_intensity_score(value: float, low: float, high: float, robust_high: float) -> float:
+    if value <= 0:
+        return 0.0
+    if value < low:
+        return max(0.0, value / max(low, EPSILON))
+    if value <= high:
+        return 1.0
+    return max(0.0, 1.0 - (value - high) / max(robust_high - high, 1.0))
 
 
 def _expanded_region(values: np.ndarray, x: int, y: int, width: int, height: int) -> np.ndarray:
@@ -181,17 +334,41 @@ def _expanded_region(values: np.ndarray, x: int, y: int, width: int, height: int
     return values[max(0, y - margin_y) : min(values.shape[0], y + height + margin_y), max(0, x - margin_x) : min(values.shape[1], x + width + margin_x)]
 
 
-def _select_spread(pool: list[_Candidate], count: int, width: int, height: int, min_distance: float) -> list[_Candidate]:
+def _ring_mean(expanded: np.ndarray, center: np.ndarray) -> float:
+    if expanded.size <= center.size:
+        return float(np.mean(expanded)) if expanded.size else 0.0
+    return float((np.sum(expanded, dtype=np.float64) - np.sum(center, dtype=np.float64)) / (expanded.size - center.size))
+
+
+def _select_spread(
+    pool: list[_Candidate],
+    count: int,
+    width: int,
+    height: int,
+    min_distance: float,
+    max_iou: float,
+) -> list[_Candidate]:
     selected: list[_Candidate] = []
+    remaining = list(pool)
     diagonal = max(float(np.hypot(width, height)), 1.0)
-    for candidate in sorted(pool, key=lambda item: item.score, reverse=True):
-        cx = candidate.x + candidate.width / 2.0
-        cy = candidate.y + candidate.height / 2.0
-        if any(np.hypot(cx - (item.x + item.width / 2.0), cy - (item.y + item.height / 2.0)) / diagonal < min_distance for item in selected):
-            continue
-        selected.append(candidate)
-        if len(selected) >= count:
+    while remaining and len(selected) < count:
+        eligible: list[tuple[float, _Candidate]] = []
+        for candidate in remaining:
+            cx = candidate.x + candidate.width / 2.0
+            cy = candidate.y + candidate.height / 2.0
+            if selected:
+                distances = [np.hypot(cx - (item.x + item.width / 2.0), cy - (item.y + item.height / 2.0)) / diagonal for item in selected]
+                nearest_distance = min(distances)
+                if nearest_distance < min_distance or any(_iou(candidate, item) > max_iou for item in selected):
+                    continue
+            else:
+                nearest_distance = 0.0
+            eligible.append((candidate.score + 0.30 * nearest_distance, candidate))
+        if not eligible:
             break
+        chosen = max(eligible, key=lambda item: item[0])[1]
+        selected.append(chosen)
+        remaining.remove(chosen)
     return selected
 
 
@@ -208,28 +385,56 @@ def _iou(first: _Candidate, second: _Candidate) -> float:
 def _recommend_surrounding(
     values: np.ndarray,
     gradient: np.ndarray,
+    edge_mask: np.ndarray,
+    strong_mask: np.ndarray,
+    high_threshold: float,
     bone: _Candidate,
     robust_high: float,
     grad_scale: float,
-) -> _Candidate | None:
+) -> tuple[_Candidate, str, str] | None:
     height, width = values.shape
+    w, h = bone.width, bone.height
     positions = (
-        (bone.x - bone.width, bone.y), (bone.x + bone.width, bone.y),
-        (bone.x, bone.y - bone.height), (bone.x, bone.y + bone.height),
+        (bone.x - w, bone.y, 0.00), (bone.x + w, bone.y, 0.00),
+        (bone.x, bone.y - h, 0.00), (bone.x, bone.y + h, 0.00),
+        (bone.x - w, bone.y - h, 0.08), (bone.x + w, bone.y - h, 0.08),
+        (bone.x - w, bone.y + h, 0.08), (bone.x + w, bone.y + h, 0.08),
     )
-    candidates: list[_Candidate] = []
-    for x, y in positions:
-        if x < 0 or y < 0 or x + bone.width > width or y + bone.height > height:
+    candidates: list[tuple[_Candidate, float]] = []
+    for x, y, distance_penalty in positions:
+        if x < 0 or y < 0 or x + w > width or y + h > height:
             continue
-        candidate = _describe(values, gradient, x, y, bone.width, bone.height)
+        candidate = _describe(values, gradient, edge_mask, strong_mask, high_threshold, x, y, w, h)
         if candidate.std <= EPSILON or candidate.unique < 2 or candidate.nonzero_fraction < 0.02:
             continue
-        grad_norm = min(candidate.gradient / grad_scale, 1.0)
-        mean_distance = min(abs(candidate.mean - bone.mean) / robust_high, 1.0)
-        strong_penalty = max(0.0, candidate.mean / robust_high - 0.70)
-        candidate.score = 0.45 * (1.0 - grad_norm) + 0.35 * (1.0 - mean_distance) + 0.20 * min(candidate.nonzero_fraction * 2.0, 1.0) - 0.40 * strong_penalty
-        candidates.append(candidate)
-    return max(candidates, key=lambda item: item.score) if candidates else None
+        if candidate.strong_overlap > 0.25 or candidate.high_fraction > 0.45 or candidate.edge_density > 0.58:
+            continue
+        ratio = candidate.mean / max(bone.mean, EPSILON)
+        intensity_relation = max(0.0, 1.0 - abs(ratio - 0.55) / 0.55) if 0.0 < ratio < 1.05 else 0.0
+        lower_gradient = max(0.0, 1.0 - candidate.gradient / max(bone.gradient, grad_scale * 0.10, EPSILON))
+        low_edge = max(0.0, 1.0 - candidate.edge_density / max(bone.edge_density, 0.10))
+        effective_signal = min(candidate.nonzero_fraction / 0.35, 1.0)
+        nonconstant = min(candidate.std / max(robust_high * 0.04, 1.0), 1.0)
+        candidate.score = (
+            0.32 * intensity_relation
+            + 0.25 * lower_gradient
+            + 0.18 * low_edge
+            + 0.15 * effective_signal
+            + 0.10 * nonconstant
+            - 0.55 * candidate.strong_overlap
+            - distance_penalty
+        )
+        candidates.append((candidate, ratio))
+    if not candidates:
+        return None
+    candidate, ratio = max(candidates, key=lambda item: item[0].score)
+    quality = "推荐" if ratio < 0.95 and candidate.strong_overlap < 0.10 and candidate.edge_density < 0.30 and candidate.gradient < bone.gradient else "需检查"
+    explanation = (
+        f"相邻非骨参考候选；均值/Bone均值={ratio:.3f}，平均梯度={candidate.gradient:.3f}，"
+        f"边缘密度={candidate.edge_density:.1%}，高响应比例={candidate.high_fraction:.1%}，"
+        f"强响应重叠={candidate.strong_overlap:.1%}。不再奖励与 Bone 灰度接近。"
+    )
+    return candidate, quality, explanation
 
 
 def _background_explanation(candidate: _Candidate) -> str:

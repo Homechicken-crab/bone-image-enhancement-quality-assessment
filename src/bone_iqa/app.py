@@ -12,7 +12,7 @@ from .images import load_grayscale
 from .metrics import EPSILON, roi_statistics
 from .models import ROI
 from .project_store import ProjectError, ProjectStore, nearest_surrounding_roi_id
-from .roi_recommender import ROIRecommendation, recommend_rois
+from .roi_recommender import ROIRecommendation, recommend_rois, remove_recommendation
 from .validation import validate_project
 
 
@@ -399,6 +399,7 @@ class BoneIQAApp(tk.Tk):
         self._selected_recommendation_id = None
         self.recommendation_tree.selection_remove(self.recommendation_tree.selection())
         self._populate_roi_form(roi)
+        self.refresh_roi_canvas()
 
     def _populate_roi_form(self, roi: ROI):
         self.roi_name_var.set(roi.name)
@@ -422,6 +423,7 @@ class BoneIQAApp(tk.Tk):
         self.roi_tree.selection_remove(self.roi_tree.selection())
         self._populate_roi_form(recommendation.roi)
         self._set_status(recommendation.explanation)
+        self.refresh_roi_canvas()
 
     def save_roi(self):
         store = self._require_store()
@@ -484,7 +486,16 @@ class BoneIQAApp(tk.Tk):
             if not self.roi_recommendations:
                 messagebox.showwarning("未找到候选", "未找到满足非恒定背景和结构评分要求的候选 ROI，请继续手工标注。")
             else:
-                self._set_status(f"已生成 {len(self.roi_recommendations)} 个候选；虚线框仅为推荐，接受后才写入项目。")
+                counts = {key: sum(1 for item in self.roi_recommendations if item.roi.type == key) for key in ROI_LABELS}
+                unpaired = sum(1 for item in self.roi_recommendations if item.roi.type in {"weak_bone", "strong_bone"} and not item.roi.paired_surrounding_roi_id)
+                message = (
+                    f"已生成：Background {counts['background']}，Strong Bone {counts['strong_bone']}，"
+                    f"Weak Bone {counts['weak_bone']}，Surrounding {counts['surrounding']}。"
+                    "所有 Bone 候选均已自动尝试配对。"
+                )
+                if unpaired:
+                    message += f"有 {unpaired} 个 Bone 候选未找到可靠 Surrounding，请人工检查。"
+                self._set_status(message)
         except Exception as exc:
             messagebox.showerror("ROI 推荐失败", str(exc))
 
@@ -531,11 +542,13 @@ class BoneIQAApp(tk.Tk):
         if self._selected_recommendation_id:
             removed_id = self._selected_recommendation_id
             removed = next((item for item in self.roi_recommendations if item.roi.id == removed_id), None)
-            self.roi_recommendations = [item for item in self.roi_recommendations if item.roi.id != removed_id]
-            if removed and removed.roi.type == "surrounding":
-                for item in self.roi_recommendations:
-                    if item.roi.paired_surrounding_roi_id == removed_id:
-                        item.roi.paired_surrounding_roi_id = None
+            remove_neighbor = False
+            if removed and removed.roi.type in {"weak_bone", "strong_bone"} and removed.roi.paired_surrounding_roi_id:
+                pair_id = removed.roi.paired_surrounding_roi_id
+                used_elsewhere = any(item.roi.id != removed_id and item.roi.paired_surrounding_roi_id == pair_id for item in self.roi_recommendations)
+                pair_exists = any(item.roi.id == pair_id for item in self.roi_recommendations)
+                remove_neighbor = pair_exists and not used_elsewhere and messagebox.askyesno("删除配对候选", "该 Bone 的 Surrounding 未被其他候选使用，是否一并删除？")
+            self.roi_recommendations = remove_recommendation(self.roi_recommendations, removed_id, remove_neighbor)
         else:
             self.roi_recommendations = []
         self.clear_roi_form()
@@ -737,27 +750,55 @@ class BoneIQAApp(tk.Tk):
             self._roi_scale = scale
             self._roi_offset = (ox, oy)
             canvas.create_image(ox, oy, image=self._roi_photo, anchor="nw")
-            for roi in self.store.project.rois:
-                if not roi.visible:
-                    continue
-                x1 = ox + roi.x * scale
-                y1 = oy + roi.y * scale
-                x2 = ox + (roi.x + roi.width) * scale
-                y2 = oy + (roi.y + roi.height) * scale
-                color = ROI_COLORS[roi.type]
-                canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=2)
-                canvas.create_text(x1 + 3, y1 + 3, text=roi.name, fill=color, anchor="nw", font=("Microsoft YaHei UI", 9, "bold"))
-            for recommendation in self.roi_recommendations:
-                roi = recommendation.roi
-                x1 = ox + roi.x * scale
-                y1 = oy + roi.y * scale
-                x2 = ox + (roi.x + roi.width) * scale
-                y2 = oy + (roi.y + roi.height) * scale
-                color = ROI_COLORS[roi.type]
-                canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=2, dash=(6, 4))
-                canvas.create_text(x1 + 3, y1 + 3, text="推荐：" + roi.name, fill=color, anchor="nw", font=("Microsoft YaHei UI", 9))
+            formal = [roi for roi in self.store.project.rois if roi.visible]
+            recommended = [item.roi for item in self.roi_recommendations]
+            all_rois = formal + recommended
+            labels = self._short_roi_labels(all_rois)
+            highlighted = self._linked_highlight_ids(all_rois)
+            for roi in formal:
+                self._draw_roi(canvas, roi, labels[roi.id], ox, oy, scale, roi.id in highlighted, recommended=False)
+            for roi in recommended:
+                self._draw_roi(canvas, roi, labels[roi.id], ox, oy, scale, roi.id in highlighted, recommended=True)
+            legend = "W  Weak Bone    S  Strong Bone    N  Surrounding    BG  Background"
+            canvas.create_rectangle(8, 8, 505, 32, fill="#111", outline="#888")
+            canvas.create_text(16, 20, text=legend, fill="white", anchor="w", font=("Microsoft YaHei UI", 9))
         except Exception as exc:
             canvas.create_text(20, 20, text=f"无法显示原图：{exc}", fill="white", anchor="nw")
+
+    def _short_roi_labels(self, rois: list[ROI]) -> dict[str, str]:
+        prefixes = {"weak_bone": "W", "strong_bone": "S", "surrounding": "N", "background": "BG"}
+        counters = {key: 0 for key in prefixes}
+        labels: dict[str, str] = {}
+        for roi in rois:
+            counters[roi.type] += 1
+            labels[roi.id] = f"{prefixes[roi.type]}{counters[roi.type]}"
+        return labels
+
+    def _linked_highlight_ids(self, rois: list[ROI]) -> set[str]:
+        selected_id = self._selected_roi_id or self._selected_recommendation_id
+        if not selected_id:
+            return set()
+        selected = next((roi for roi in rois if roi.id == selected_id), None)
+        if selected is None:
+            return set()
+        highlighted = {selected.id}
+        if selected.type in {"weak_bone", "strong_bone"} and selected.paired_surrounding_roi_id:
+            highlighted.add(selected.paired_surrounding_roi_id)
+        if selected.type == "surrounding":
+            highlighted.update(roi.id for roi in rois if roi.paired_surrounding_roi_id == selected.id)
+        return highlighted
+
+    def _draw_roi(self, canvas, roi: ROI, label: str, ox: float, oy: float, scale: float, highlighted: bool, recommended: bool):
+        x1, y1 = ox + roi.x * scale, oy + roi.y * scale
+        x2, y2 = ox + (roi.x + roi.width) * scale, oy + (roi.y + roi.height) * scale
+        any_selection = bool(self._selected_roi_id or self._selected_recommendation_id)
+        color = ROI_COLORS[roi.type] if highlighted or not any_selection else "#707070"
+        width = 4 if highlighted else 2 if not any_selection else 1
+        options = {"outline": color, "width": width}
+        if recommended:
+            options["dash"] = (6, 4)
+        canvas.create_rectangle(x1, y1, x2, y2, **options)
+        canvas.create_text(x1 + 3, y1 + 3, text=label, fill=color, anchor="nw", font=("Microsoft YaHei UI", 10, "bold" if highlighted else "normal"))
 
     def _fill_results(self, result):
         self.summary_tree.delete(*self.summary_tree.get_children())
