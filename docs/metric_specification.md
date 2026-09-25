@@ -1,7 +1,7 @@
 # 骨骼图像增强质量评价平台：第一阶段指标规范
 
 **文件名：** `metric_specification.md`  
-**规范版本：** 1.1.0  
+**规范版本：** 1.1.1
 **适用阶段：** 第一阶段（最小可用评价闭环）  
 **状态：** 已确认，作为第一阶段实现与测试基线
 
@@ -144,6 +144,7 @@ s=\sqrt{\frac{1}{n-1}\sum_{k=1}^{n}(x_k-\bar{x})^2}
 对每张图像和每个 ROI，首先计算并保存：
 
 - `pixel_count`
+- `unique_pixel_count`
 - `mean_intensity`
 - `std_intensity`
 - `min_intensity`
@@ -183,6 +184,8 @@ Noise_i=s_i
 - \(s_i\) 为第 \(i\) 个 Background ROI 的样本标准差
 
 `background_noise_pooled` 作为总体表中的 Background Noise 主值。
+
+如果 Background ROI 的标准差不大于 \(\varepsilon\)，或唯一灰度数小于 2，该区域视为不能有效估计真实背景噪声。程序保留其原始统计值并给出警告，不向分母人为添加 epsilon；当合并背景噪声不大于 \(\varepsilon\) 时，Background-based CNR 保持不可计算，Local CNR 不受影响。
 
 ### 7.3 有效条件
 
@@ -275,7 +278,7 @@ Local CNR 回答：在该骨骼区域及其直接周围的局部灰度波动下�
 
 ```json
 {
-  "primary_cnr": "background"
+  "primary_cnr": "local"
 }
 ```
 
@@ -284,7 +287,7 @@ Local CNR 回答：在该骨骼区域及其直接周围的局部灰度波动下�
 - `background`
 - `local`
 
-第一阶段默认值为 `background`，用于选择 Background-based CNR 或 Local CNR 作为主 CNR 类型。总体主 CNR 的 ROI 聚合范围固定为 Weak Bone ROI，即：
+新建项目默认值为 `local`，用于选择 Background-based CNR 或 Local CNR 作为主 CNR 类型；已有项目继续使用 `project.json` 中保存的配置，不强制改变。总体主 CNR 的 ROI 聚合范围固定为 Weak Bone ROI，即：
 
 - `primary_cnr = weak_bone_mean_cnr_background`，或
 - `primary_cnr = weak_bone_mean_cnr_local`
@@ -599,10 +602,19 @@ SSIM 不计算相对原图变化百分比，只保存 `ssim` 和 `1 - ssim`。
 | `ssim` | 相对原图的全图 SSIM |
 | `strong_bone_saturation_mean` | Strong Bone ROI 饱和比例均值 |
 | `saturation_change_pp` | 相对原图百分点变化 |
-| `status` | `valid`、`partial` 或 `failed` |
+| `status` | `valid`、`valid_with_warnings`、`partial` 或 `failed` |
 | `message` | 缺失指标、警告或失败原因 |
 
 即使界面将其中一个 CNR 作为主列，也应允许用户查看另一个 CNR。
+
+状态按核心评价与辅助检查分层：
+
+- `valid`：至少一种 Weak Bone CNR、Weak Bone Mean AG 和 SSIM 均有效，且没有警告。
+- `valid_with_warnings`：核心评价可完成，但辅助指标不可计算或存在 ROI 警告。
+- `partial`：两种 Weak Bone CNR 均无效、Weak Bone Mean AG 缺失或 SSIM 缺失。
+- `failed`：图像文件、尺寸、位深等基础条件不满足，无法进入评价。
+
+缺少 Strong Bone ROI 或 Saturation Ratio 只产生警告，不单独导致 `partial`。
 
 ## 19. ROI 表字段
 
@@ -776,7 +788,7 @@ SSIM 不计算相对原图变化百分比，只保存 `ssim` 和 `1 - ssim`。
 1. 同时保存 Background-based CNR 和 Local CNR。
 2. Background-based CNR 使用多个 Background ROI 的合并内部方差。
 3. Local CNR 使用 Bone 和对应 Surrounding ROI 方差的均方合成。
-4. 默认主 CNR 类型暂设为 Background-based CNR，总体主值使用 Weak Bone Mean；All Bone Mean 和 Strong Bone Mean 作为辅助结果。
+4. 新项目默认主 CNR 类型为 Local CNR，总体主值使用 Weak Bone Mean；Background-based、All Bone Mean 和 Strong Bone Mean 作为完整辅助结果保留。
 5. Strong Bone ROI 使用默认 98% 灰度上限阈值计算 Saturation Ratio。
 6. 饱和变化默认以百分点而非相对百分比展示。
 7. 总体清晰度主指标使用 Weak Bone Mean Average Gradient；Global AG 和 Strong Bone Mean AG 作为辅助结果。

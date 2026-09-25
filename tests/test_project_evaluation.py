@@ -48,7 +48,7 @@ class ProjectEvaluationTest(unittest.TestCase):
         self.assertEqual(original["ssim"], 1.0)
         self.assertIsNotNone(enhanced["weak_bone_mean_cnr_background"])
         self.assertIsNotNone(enhanced["weak_bone_mean_cnr_local"])
-        self.assertEqual(enhanced["primary_cnr"], enhanced["weak_bone_mean_cnr_background"])
+        self.assertEqual(enhanced["primary_cnr"], enhanced["weak_bone_mean_cnr_local"])
         self.assertIsNotNone(enhanced["weak_bone_mean_average_gradient"])
         self.assertGreater(enhanced["strong_bone_saturation_mean"], original["strong_bone_saturation_mean"])
 
@@ -67,7 +67,7 @@ class ProjectEvaluationTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         with (export_dir / "evaluation.json").open("r", encoding="utf-8") as stream:
             saved = json.load(stream)
-        self.assertEqual(saved["metric_spec_version"], "1.1.0")
+        self.assertEqual(saved["metric_spec_version"], "1.1.1")
 
         reopened.project.rois[0].x += 1
         reopened.upsert_roi(reopened.project.rois[0])

@@ -20,6 +20,7 @@ class MetricsTest(unittest.TestCase):
         values = np.array([[1, 2], [3, 4]], dtype=np.uint8)
         stats = roi_statistics(values)
         self.assertEqual(stats["pixel_count"], 4)
+        self.assertEqual(stats["unique_pixel_count"], 4)
         self.assertAlmostEqual(stats["mean_intensity"], 2.5)
         self.assertAlmostEqual(stats["std_intensity"], np.std(values, ddof=1))
 
@@ -64,4 +65,3 @@ class MetricsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

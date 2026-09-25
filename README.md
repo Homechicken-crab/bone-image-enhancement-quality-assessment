@@ -2,7 +2,7 @@
 
 骨骼图像增强质量评价平台是一个面向“光电图像处理课程设计”的本地科研实验工具，用统一 ROI、统一灰度范围和统一指标定义比较原图及多个增强算法结果。
 
-当前版本遵循 [指标规范 1.1.0](docs/metric_specification.md)，重点保证正确性、可重复性、实验公平性和后续扩展能力。
+当前版本为 `v0.1.1`，遵循 [指标规范 1.1.1](docs/metric_specification.md)，重点保证正确性、可重复性、实验公平性和后续扩展能力。
 
 ## 已实现
 
@@ -21,6 +21,7 @@
 - Strong Bone Saturation Ratio
 - 批量评价、总体表、辅助指标表、ROI 表
 - `metrics.csv`、`roi_metrics.csv`、`validation.csv` 和完整 JSON 导出
+- 基于原图的可解释 ROI 自动推荐助手
 
 ## 安装与运行
 
@@ -35,7 +36,7 @@ python -m pip install -e .
 python -m bone_iqa
 ```
 
-安装完成后，也可以运行 `run.ps1`，或者直接双击 `run.bat`。
+推荐启动方式：直接双击 `run.bat`。批处理会依次尝试 `.venv\Scripts\python.exe`、`py -3` 和 `python`，失败时会保留窗口并显示退出码。`run.ps1` 作为备用入口。
 
 使用源码直接启动：
 
@@ -44,16 +45,26 @@ $env:PYTHONPATH = "$PWD\src"
 python -m bone_iqa
 ```
 
-## 推荐操作顺序
+如果双击启动失败，请在项目目录打开 PowerShell 并执行：
 
-1. 新建一个空项目目录。
-2. 导入原始灰度图。
-3. 添加若干算法结果并查看一致性检查。
-4. 先创建 Surrounding ROI 和 Background ROI。
-5. 创建 Weak/Strong Bone ROI，并为每个 Bone ROI 选择对应的 Surrounding ROI。
-6. 点击“开始评价”。
-7. 检查总体表、辅助指标表、ROI 表和验证信息。
-8. 导出 CSV。
+```powershell
+$env:PYTHONPATH="$PWD\src"; python -m bone_iqa
+```
+
+## 最简使用流程
+
+1. 双击 `run.bat`。
+2. 新建项目。
+3. 导入原图。
+4. 添加增强结果。
+5. 在 ROI 标注页点击“自动推荐 ROI”。
+6. 检查并接受推荐。
+7. 必要时手工微调。
+8. 开始评价。
+9. 查看总体表和详细结果。
+10. 导出 CSV。
+
+自动 ROI 只分析原图，候选以虚线显示，只有用户接受后才写入项目。它是减少手工操作的辅助推荐，不是医学自动诊断或精确骨分割。所有算法始终使用用户最终确认的同一组 ROI。
 
 ## 公平性约束
 
@@ -61,7 +72,7 @@ python -m bone_iqa
 
 ## 指标解释原则
 
-- Background-based CNR 和 Local CNR 同时保存；默认主指标是 Weak Bone Mean Background-based CNR。
+- Background-based CNR 和 Local CNR 同时保存；新项目默认主指标是 Weak Bone Mean Local CNR。
 - 清晰度主指标是 Weak Bone Mean Average Gradient，全图 AG 仅作为辅助结果。
 - Background Noise 使用 Background ROI 的合并内部方差估计。
 - Saturation Ratio 用于提示 Strong Bone ROI 的高亮饱和风险。
@@ -85,4 +96,4 @@ python -m unittest discover -s tests -v
 
 ## 项目状态
 
-当前为第一阶段 `v0.1.0`。后续计划包括局部视觉对比、同步缩放、图表、Excel、规则化文字摘要和更多辅助指标。
+当前为第一阶段 `v0.1.1`。后续计划包括局部视觉对比、同步缩放、图表、Excel、规则化文字摘要和更多辅助指标。

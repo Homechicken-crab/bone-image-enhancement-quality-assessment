@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .images import file_sha256, load_grayscale
+from .metrics import EPSILON, roi_statistics
 from .models import Project, ValidationIssue
 from .project_store import ProjectStore
 
@@ -15,6 +16,12 @@ def validate_project(store: ProjectStore) -> list[ValidationIssue]:
 
     original = project.original
     _validate_record(store, original, issues, None)
+    original_array = None
+    if not any(issue.severity == "error" and issue.object_id == original.id for issue in issues):
+        try:
+            original_array = load_grayscale(store.resolve(original.relative_path))
+        except Exception:
+            original_array = None
     for algorithm in project.algorithms:
         _validate_record(store, algorithm, issues, original)
 
@@ -35,6 +42,14 @@ def validate_project(store: ProjectStore) -> list[ValidationIssue]:
             pair = next((item for item in project.rois if item.id == roi.paired_surrounding_roi_id), None)
             if pair is None or pair.type != "surrounding":
                 issues.append(ValidationIssue("warning", "missing_surrounding_pair", roi.id, f"Bone ROI“{roi.name}”没有有效的 Surrounding 配对"))
+        if roi.type == "background" and original_array is not None and roi.width > 0 and roi.height > 0:
+            region = original_array[roi.y : roi.y + roi.height, roi.x : roi.x + roi.width]
+            stats = roi_statistics(region)
+            if stats["std_intensity"] is None or float(stats["std_intensity"]) <= EPSILON or int(stats["unique_pixel_count"] or 0) < 2:
+                issues.append(ValidationIssue(
+                    "warning", "constant_background_roi", roi.id,
+                    f"背景 ROI“{roi.name}”几乎为常量区域（std={stats['std_intensity'] or 0:.6g}，唯一灰度数={stats['unique_pixel_count']}），无法有效估计背景噪声。建议重新选择包含真实背景波动但不含人体结构的区域。",
+                ))
 
     if not any(roi.type == "weak_bone" for roi in project.rois):
         issues.append(ValidationIssue("warning", "missing_weak_bone", project.id, "尚未创建 Weak Bone ROI，主 CNR 和主清晰度指标不可计算"))

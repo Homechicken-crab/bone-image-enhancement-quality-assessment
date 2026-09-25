@@ -21,6 +21,7 @@ def roi_statistics(values: np.ndarray) -> dict[str, float | int | None]:
     if flat.size == 0:
         return {
             "pixel_count": 0,
+            "unique_pixel_count": 0,
             "mean_intensity": None,
             "std_intensity": None,
             "min_intensity": None,
@@ -28,6 +29,7 @@ def roi_statistics(values: np.ndarray) -> dict[str, float | int | None]:
         }
     return {
         "pixel_count": int(flat.size),
+        "unique_pixel_count": int(np.unique(flat).size),
         "mean_intensity": float(np.mean(flat)),
         "std_intensity": sample_std(flat),
         "min_intensity": float(np.min(flat)),
@@ -150,4 +152,3 @@ def structural_similarity(
     if valid.size == 0:
         return None
     return float(np.mean(valid))
-

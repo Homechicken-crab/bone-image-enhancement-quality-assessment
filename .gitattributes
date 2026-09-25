@@ -1,0 +1,3 @@
+# Preserve run.bat byte-for-byte: ASCII encoding with explicit CRLF line endings.
+run.bat -text
+

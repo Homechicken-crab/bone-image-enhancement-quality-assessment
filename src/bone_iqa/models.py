@@ -79,7 +79,7 @@ class ROI:
 class EvaluationConfig:
     gray_min: int = 0
     gray_max: int = 255
-    primary_cnr: Literal["background", "local"] = "background"
+    primary_cnr: Literal["background", "local"] = "local"
     saturation_threshold_ratio: float = 0.98
 
     @classmethod
@@ -132,4 +132,3 @@ class ValidationIssue:
 
     def to_dict(self) -> dict[str, str]:
         return asdict(self)
-

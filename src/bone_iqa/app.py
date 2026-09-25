@@ -8,8 +8,11 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from PIL import Image, ImageTk
 
 from .evaluator import evaluate_project, export_csv_bundle
+from .images import load_grayscale
+from .metrics import EPSILON, roi_statistics
 from .models import ROI
-from .project_store import ProjectError, ProjectStore
+from .project_store import ProjectError, ProjectStore, nearest_surrounding_roi_id
+from .roi_recommender import ROIRecommendation, recommend_rois
 from .validation import validate_project
 
 
@@ -50,6 +53,8 @@ class BoneIQAApp(tk.Tk):
         self._drag_start = None
         self._drag_preview = None
         self._selected_roi_id: str | None = None
+        self._selected_recommendation_id: str | None = None
+        self.roi_recommendations: list[ROIRecommendation] = []
         self._build_menu()
         self._build_ui()
         self._set_status("请新建或打开评价项目")
@@ -131,14 +136,33 @@ class BoneIQAApp(tk.Tk):
 
         right = ttk.Frame(self.roi_tab, padding=8, width=340)
         right.grid(row=0, column=1, sticky="ns")
+        recommend_bar = ttk.Frame(right)
+        recommend_bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(recommend_bar, text="自动推荐 ROI", command=self.auto_recommend_rois).pack(side="left", padx=2)
+        ttk.Button(recommend_bar, text="重新推荐", command=self.auto_recommend_rois).pack(side="left", padx=2)
         ttk.Label(right, text="ROI 列表", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
-        self.roi_tree = ttk.Treeview(right, columns=("type", "name"), show="headings", height=11, selectmode="browse")
+        self.roi_tree = ttk.Treeview(right, columns=("type", "name", "pair"), show="headings", height=7, selectmode="browse")
         self.roi_tree.heading("type", text="类型")
         self.roi_tree.heading("name", text="名称")
-        self.roi_tree.column("type", width=110)
-        self.roi_tree.column("name", width=170)
+        self.roi_tree.heading("pair", text="配对")
+        self.roi_tree.column("type", width=90)
+        self.roi_tree.column("name", width=145)
+        self.roi_tree.column("pair", width=145)
         self.roi_tree.pack(fill="x", pady=(5, 8))
         self.roi_tree.bind("<<TreeviewSelect>>", self._roi_selected)
+
+        ttk.Label(right, text="推荐候选（虚线）", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
+        self.recommendation_tree = ttk.Treeview(right, columns=("type", "name", "quality"), show="headings", height=6, selectmode="browse")
+        for key, label, width in (("type", "类型", 90), ("name", "名称", 160), ("quality", "质量", 100)):
+            self.recommendation_tree.heading(key, text=label)
+            self.recommendation_tree.column(key, width=width)
+        self.recommendation_tree.pack(fill="x", pady=(4, 5))
+        self.recommendation_tree.bind("<<TreeviewSelect>>", self._recommendation_selected)
+        candidate_buttons = ttk.Frame(right)
+        candidate_buttons.pack(fill="x", pady=(0, 7))
+        ttk.Button(candidate_buttons, text="接受选中", command=self.accept_selected_recommendation).pack(side="left", padx=2)
+        ttk.Button(candidate_buttons, text="全部接受", command=self.accept_all_recommendations).pack(side="left", padx=2)
+        ttk.Button(candidate_buttons, text="删除推荐", command=self.delete_recommendations).pack(side="left", padx=2)
 
         form = ttk.LabelFrame(right, text="ROI 属性", padding=8)
         form.pack(fill="x")
@@ -171,7 +195,12 @@ class BoneIQAApp(tk.Tk):
         toolbar.pack(fill="x")
         ttk.Button(toolbar, text="开始评价", command=self.run_evaluation).pack(side="left", padx=3)
         ttk.Button(toolbar, text="导出 CSV", command=self.export_results).pack(side="left", padx=3)
-        self.primary_label = tk.StringVar(value="主 CNR：Background-based / Weak Bone Mean")
+        ttk.Label(toolbar, text="主 CNR 类型").pack(side="left", padx=(14, 3))
+        self.primary_cnr_var = tk.StringVar(value="local")
+        primary_combo = ttk.Combobox(toolbar, textvariable=self.primary_cnr_var, values=("local", "background"), state="readonly", width=12)
+        primary_combo.pack(side="left")
+        primary_combo.bind("<<ComboboxSelected>>", self._primary_cnr_changed)
+        self.primary_label = tk.StringVar(value="主 CNR：Local / Weak Bone Mean")
         ttk.Label(toolbar, textvariable=self.primary_label).pack(side="right", padx=8)
 
         result_book = ttk.Notebook(self.evaluate_tab)
@@ -185,16 +214,16 @@ class BoneIQAApp(tk.Tk):
         result_book.add(roi_frame, text="ROI 表")
         result_book.add(validation_frame, text="检查结果")
 
-        summary_columns = ("name", "cnr", "cnr_change", "ag", "ag_change", "noise", "noise_change", "ssim", "sat", "sat_change", "status")
+        summary_columns = ("name", "cnr", "cnr_change", "ag", "ag_change", "noise", "noise_change", "ssim", "sat", "sat_change", "status", "message")
         self.summary_tree = ttk.Treeview(summary_frame, columns=summary_columns, show="headings")
         summary_headers = {
             "name": "方案", "cnr": "Weak CNR", "cnr_change": "CNR Δ%", "ag": "Weak AG",
             "ag_change": "AG Δ%", "noise": "Noise", "noise_change": "Noise Δ%",
-            "ssim": "SSIM", "sat": "Strong Sat.%", "sat_change": "Sat. Δpp", "status": "状态",
+            "ssim": "SSIM", "sat": "Strong Sat.%", "sat_change": "Sat. Δpp", "status": "状态", "message": "说明",
         }
         for key in summary_columns:
             self.summary_tree.heading(key, text=summary_headers[key])
-            self.summary_tree.column(key, width=115 if key == "name" else 88, anchor="center")
+            self.summary_tree.column(key, width=340 if key == "message" else 115 if key == "name" else 88, anchor="w" if key == "message" else "center")
         self.summary_tree.pack(fill="both", expand=True)
 
         auxiliary_columns = ("name", "all_bg", "all_local", "strong_bg", "strong_local", "global_ag", "strong_ag")
@@ -209,11 +238,11 @@ class BoneIQAApp(tk.Tk):
             self.auxiliary_tree.column(key, width=150 if key == "name" else 125, anchor="center")
         self.auxiliary_tree.pack(fill="both", expand=True)
 
-        roi_columns = ("scheme", "roi", "type", "mean", "std", "ag", "cnr_bg", "cnr_local", "sat", "status")
+        roi_columns = ("scheme", "roi", "type", "mean", "std", "ag", "cnr_bg", "cnr_local", "sat", "status", "message")
         self.roi_result_tree = ttk.Treeview(roi_frame, columns=roi_columns, show="headings")
-        for key, label in zip(roi_columns, ("方案", "ROI", "类型", "均值", "标准差", "AG", "CNR-bg", "CNR-local", "饱和率", "状态")):
+        for key, label in zip(roi_columns, ("方案", "ROI", "类型", "均值", "标准差", "AG", "CNR-bg", "CNR-local", "饱和率", "状态", "原因")):
             self.roi_result_tree.heading(key, text=label)
-            self.roi_result_tree.column(key, width=115 if key in {"scheme", "roi"} else 88, anchor="center")
+            self.roi_result_tree.column(key, width=280 if key == "message" else 115 if key in {"scheme", "roi"} else 88, anchor="w" if key == "message" else "center")
         self.roi_result_tree.pack(fill="both", expand=True)
 
         self.validation_tree = ttk.Treeview(validation_frame, columns=("severity", "object", "message"), show="headings")
@@ -240,6 +269,7 @@ class BoneIQAApp(tk.Tk):
             return
         try:
             self.store = ProjectStore.create(Path(directory), name)
+            self.roi_recommendations = []
             self.refresh_all()
             self._set_status(f"已创建项目：{self.store.project.name}")
         except Exception as exc:
@@ -251,6 +281,7 @@ class BoneIQAApp(tk.Tk):
             return
         try:
             self.store = ProjectStore.open(Path(directory))
+            self.roi_recommendations = []
             self.refresh_all()
             self._set_status(f"已打开项目：{self.store.project.name}")
         except Exception as exc:
@@ -273,6 +304,7 @@ class BoneIQAApp(tk.Tk):
             return
         try:
             store.set_original(Path(path))
+            self.roi_recommendations = []
             self.refresh_all()
             self._set_status("原图已导入并复制到项目目录")
         except Exception as exc:
@@ -345,12 +377,14 @@ class BoneIQAApp(tk.Tk):
 
     def clear_roi_form(self):
         self._selected_roi_id = None
+        self._selected_recommendation_id = None
         self.roi_name_var.set("")
         self.roi_type_var.set("weak_bone")
         self.roi_pair_var.set("")
         for variable in self.roi_coord_vars.values():
             variable.set("0")
         self.roi_tree.selection_remove(self.roi_tree.selection())
+        self.recommendation_tree.selection_remove(self.recommendation_tree.selection())
 
     def _roi_selected(self, _event=None):
         store = self.store
@@ -362,12 +396,32 @@ class BoneIQAApp(tk.Tk):
         if roi is None:
             return
         self._selected_roi_id = roi.id
+        self._selected_recommendation_id = None
+        self.recommendation_tree.selection_remove(self.recommendation_tree.selection())
+        self._populate_roi_form(roi)
+
+    def _populate_roi_form(self, roi: ROI):
         self.roi_name_var.set(roi.name)
         self.roi_type_var.set(roi.type)
         for key, value in zip(("x", "y", "width", "height"), roi.geometry()):
             self.roi_coord_vars[key].set(str(value))
-        pair = next((item for item in store.project.rois if item.id == roi.paired_surrounding_roi_id), None)
+        all_rois = list(self.store.project.rois) if self.store else []
+        all_rois.extend(item.roi for item in self.roi_recommendations)
+        pair = next((item for item in all_rois if item.id == roi.paired_surrounding_roi_id), None)
         self.roi_pair_var.set(f"{pair.name} | {pair.id}" if pair else "")
+
+    def _recommendation_selected(self, _event=None):
+        selection = self.recommendation_tree.selection()
+        if not selection:
+            return
+        recommendation = next((item for item in self.roi_recommendations if item.roi.id == selection[0]), None)
+        if recommendation is None:
+            return
+        self._selected_recommendation_id = recommendation.roi.id
+        self._selected_roi_id = None
+        self.roi_tree.selection_remove(self.roi_tree.selection())
+        self._populate_roi_form(recommendation.roi)
+        self._set_status(recommendation.explanation)
 
     def save_roi(self):
         store = self._require_store()
@@ -392,12 +446,101 @@ class BoneIQAApp(tk.Tk):
                 )
             if roi.x < 0 or roi.y < 0 or roi.width <= 0 or roi.height <= 0 or roi.x + roi.width > store.project.original.width or roi.y + roi.height > store.project.original.height:
                 raise ProjectError("ROI 必须具有正尺寸并完全位于原图范围内")
+            if roi.type in {"weak_bone", "strong_bone"} and not roi.paired_surrounding_roi_id:
+                roi.paired_surrounding_roi_id = nearest_surrounding_roi_id(store.project.rois, roi)
+            if roi.type in {"weak_bone", "strong_bone"} and not roi.paired_surrounding_roi_id:
+                messagebox.showwarning("CNR 无法计算", "该 Bone ROI 尚未设置 Surrounding ROI，因此 CNR 无法计算。允许保存，但请随后创建或选择 Surrounding ROI。")
             store.upsert_roi(roi)
+            if roi.type == "background":
+                image = load_grayscale(store.resolve(store.project.original.relative_path))
+                stats = roi_statistics(image[roi.y : roi.y + roi.height, roi.x : roi.x + roi.width])
+                if stats["std_intensity"] is None or float(stats["std_intensity"]) <= EPSILON or int(stats["unique_pixel_count"] or 0) < 2:
+                    messagebox.showwarning(
+                        "背景 ROI 波动不足",
+                        "该背景 ROI 几乎为常量区域，无法有效估计背景噪声。\n\n"
+                        f"像素数：{stats['pixel_count']}\n均值：{stats['mean_intensity']}\n标准差：{stats['std_intensity']}\n"
+                        f"最小值：{stats['min_intensity']}\n最大值：{stats['max_intensity']}\n唯一灰度数：{stats['unique_pixel_count']}\n\n"
+                        "建议重新选择包含真实背景波动但不含人体结构的区域。",
+                    )
             self._selected_roi_id = roi.id
             self.refresh_all()
             self._set_status(f"ROI 已保存：{roi.name}")
         except Exception as exc:
             messagebox.showerror("保存 ROI 失败", str(exc))
+
+    def auto_recommend_rois(self):
+        store = self._require_store()
+        if not store or store.project.original is None:
+            messagebox.showwarning("缺少原图", "ROI 自动推荐只分析原图，请先导入原图。")
+            return
+        if store.project.rois and not messagebox.askyesno("保留已有 ROI", "已有正式 ROI 不会被覆盖。是否保留已有 ROI 并新增推荐候选？"):
+            return
+        try:
+            image = load_grayscale(store.resolve(store.project.original.relative_path))
+            self.roi_recommendations = recommend_rois(image)
+            self._selected_recommendation_id = None
+            self.refresh_roi_list()
+            self.refresh_roi_canvas()
+            if not self.roi_recommendations:
+                messagebox.showwarning("未找到候选", "未找到满足非恒定背景和结构评分要求的候选 ROI，请继续手工标注。")
+            else:
+                self._set_status(f"已生成 {len(self.roi_recommendations)} 个候选；虚线框仅为推荐，接受后才写入项目。")
+        except Exception as exc:
+            messagebox.showerror("ROI 推荐失败", str(exc))
+
+    def _update_recommendation_from_form(self, recommendation: ROIRecommendation) -> None:
+        roi = recommendation.roi
+        values = {key: int(variable.get()) for key, variable in self.roi_coord_vars.items()}
+        roi.name = self.roi_name_var.get().strip() or roi.name
+        roi.type = self.roi_type_var.get()
+        roi.x, roi.y, roi.width, roi.height = values["x"], values["y"], values["width"], values["height"]
+        pair_text = self.roi_pair_var.get()
+        roi.paired_surrounding_roi_id = pair_text.rsplit(" | ", 1)[-1] if roi.type in {"weak_bone", "strong_bone"} and " | " in pair_text else None
+
+    def accept_selected_recommendation(self):
+        store = self._require_store()
+        if not store or not self._selected_recommendation_id:
+            messagebox.showwarning("未选择推荐", "请先选择一个推荐候选。")
+            return
+        recommendation = next(item for item in self.roi_recommendations if item.roi.id == self._selected_recommendation_id)
+        self._update_recommendation_from_form(recommendation)
+        roi = recommendation.roi
+        paired = next((item for item in self.roi_recommendations if item.roi.id == roi.paired_surrounding_roi_id), None)
+        if paired is not None:
+            store.upsert_roi(paired.roi)
+            self.roi_recommendations.remove(paired)
+        store.upsert_roi(roi)
+        self.roi_recommendations.remove(recommendation)
+        self.clear_roi_form()
+        self.refresh_all()
+        self._set_status(f"已接受推荐 ROI：{roi.name}")
+
+    def accept_all_recommendations(self):
+        store = self._require_store()
+        if not store or not self.roi_recommendations:
+            return
+        for recommendation in sorted(self.roi_recommendations, key=lambda item: item.roi.type != "surrounding"):
+            store.upsert_roi(recommendation.roi)
+        count = len(self.roi_recommendations)
+        self.roi_recommendations = []
+        self.clear_roi_form()
+        self.refresh_all()
+        self._set_status(f"已接受并保存 {count} 个推荐 ROI；请检查并按需微调。")
+
+    def delete_recommendations(self):
+        if self._selected_recommendation_id:
+            removed_id = self._selected_recommendation_id
+            removed = next((item for item in self.roi_recommendations if item.roi.id == removed_id), None)
+            self.roi_recommendations = [item for item in self.roi_recommendations if item.roi.id != removed_id]
+            if removed and removed.roi.type == "surrounding":
+                for item in self.roi_recommendations:
+                    if item.roi.paired_surrounding_roi_id == removed_id:
+                        item.roi.paired_surrounding_roi_id = None
+        else:
+            self.roi_recommendations = []
+        self.clear_roi_form()
+        self.refresh_roi_list()
+        self.refresh_roi_canvas()
 
     def delete_roi(self):
         store = self._require_store()
@@ -447,6 +590,12 @@ class BoneIQAApp(tk.Tk):
         self.roi_coord_vars["y"].set(str(iy1))
         self.roi_coord_vars["width"].set(str(max(0, ix2 - ix1)))
         self.roi_coord_vars["height"].set(str(max(0, iy2 - iy1)))
+        if self.roi_type_var.get() in {"weak_bone", "strong_bone"} and not self.roi_pair_var.get():
+            provisional = ROI.create("provisional", self.roi_type_var.get(), ix1, iy1, max(0, ix2 - ix1), max(0, iy2 - iy1))
+            pair_id = nearest_surrounding_roi_id(self.store.project.rois, provisional)
+            pair = next((item for item in self.store.project.rois if item.id == pair_id), None)
+            if pair:
+                self.roi_pair_var.set(f"{pair.name} | {pair.id}")
         self._drag_start = None
 
     def show_validation(self):
@@ -476,6 +625,19 @@ class BoneIQAApp(tk.Tk):
         finally:
             self.config(cursor="")
 
+    def _primary_cnr_changed(self, _event=None):
+        if not self.store:
+            return
+        selected = self.primary_cnr_var.get()
+        if selected not in {"local", "background"}:
+            return
+        self.store.project.evaluation_config.primary_cnr = selected
+        self.store.project.latest_evaluation_id = None
+        self.store.save()
+        self.refresh_overview()
+        self.primary_label.set(f"主 CNR：{selected.title()} / Weak Bone Mean（需重新评价）")
+        self._set_status("主 CNR 类型已更新；请重新开始评价。两类 CNR 都会继续计算和保存。")
+
     def export_results(self):
         store = self._require_store()
         if not store:
@@ -495,6 +657,7 @@ class BoneIQAApp(tk.Tk):
         self.refresh_roi_list()
         self.refresh_roi_canvas()
         if self.store:
+            self.primary_cnr_var.set(self.store.project.evaluation_config.primary_cnr)
             result = self.store.load_latest_evaluation()
             if result:
                 self._fill_results(result)
@@ -532,16 +695,25 @@ class BoneIQAApp(tk.Tk):
 
     def refresh_roi_list(self):
         self.roi_tree.delete(*self.roi_tree.get_children())
+        self.recommendation_tree.delete(*self.recommendation_tree.get_children())
         if not self.store:
             self.roi_pair_combo["values"] = []
             return
         for roi in self.store.project.rois:
             suffix = "" if roi.visible else "（隐藏）"
-            self.roi_tree.insert("", "end", iid=roi.id, values=(ROI_LABELS[roi.type], roi.name + suffix))
-        surroundings = [f"{roi.name} | {roi.id}" for roi in self.store.project.rois if roi.type == "surrounding"]
+            pair = next((item for item in self.store.project.rois if item.id == roi.paired_surrounding_roi_id), None)
+            pair_text = f"→ {pair.name}" if pair else ""
+            self.roi_tree.insert("", "end", iid=roi.id, values=(ROI_LABELS[roi.type], roi.name + suffix, pair_text))
+        for recommendation in self.roi_recommendations:
+            roi = recommendation.roi
+            self.recommendation_tree.insert("", "end", iid=roi.id, values=(ROI_LABELS[roi.type], roi.name, recommendation.quality))
+        all_rois = list(self.store.project.rois) + [item.roi for item in self.roi_recommendations]
+        surroundings = [f"{roi.name} | {roi.id}" for roi in all_rois if roi.type == "surrounding"]
         self.roi_pair_combo["values"] = [""] + surroundings
         if self._selected_roi_id and self.roi_tree.exists(self._selected_roi_id):
             self.roi_tree.selection_set(self._selected_roi_id)
+        if self._selected_recommendation_id and self.recommendation_tree.exists(self._selected_recommendation_id):
+            self.recommendation_tree.selection_set(self._selected_recommendation_id)
 
     def refresh_roi_canvas(self):
         canvas = getattr(self, "roi_canvas", None)
@@ -575,6 +747,15 @@ class BoneIQAApp(tk.Tk):
                 color = ROI_COLORS[roi.type]
                 canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=2)
                 canvas.create_text(x1 + 3, y1 + 3, text=roi.name, fill=color, anchor="nw", font=("Microsoft YaHei UI", 9, "bold"))
+            for recommendation in self.roi_recommendations:
+                roi = recommendation.roi
+                x1 = ox + roi.x * scale
+                y1 = oy + roi.y * scale
+                x2 = ox + (roi.x + roi.width) * scale
+                y2 = oy + (roi.y + roi.height) * scale
+                color = ROI_COLORS[roi.type]
+                canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=2, dash=(6, 4))
+                canvas.create_text(x1 + 3, y1 + 3, text="推荐：" + roi.name, fill=color, anchor="nw", font=("Microsoft YaHei UI", 9))
         except Exception as exc:
             canvas.create_text(20, 20, text=f"无法显示原图：{exc}", fill="white", anchor="nw")
 
@@ -583,7 +764,8 @@ class BoneIQAApp(tk.Tk):
         self.auxiliary_tree.delete(*self.auxiliary_tree.get_children())
         self.roi_result_tree.delete(*self.roi_result_tree.get_children())
         self._fill_validation(result.get("validation", []))
-        primary = result.get("config", {}).get("primary_cnr", "background")
+        primary = result.get("config", {}).get("primary_cnr", "local")
+        self.primary_cnr_var.set(primary)
         self.primary_label.set(f"主 CNR：{primary.title()} / Weak Bone Mean")
         for row in result.get("metrics", []):
             self.summary_tree.insert("", "end", values=(
@@ -592,7 +774,7 @@ class BoneIQAApp(tk.Tk):
                 format_number(row.get("weak_bone_mean_average_gradient_change_percent"), 2), format_number(row.get("background_noise_pooled")),
                 format_number(row.get("background_noise_change_percent"), 2), format_number(row.get("ssim")),
                 format_number(None if row.get("strong_bone_saturation_mean") is None else row["strong_bone_saturation_mean"] * 100, 2),
-                format_number(row.get("saturation_change_pp"), 2), row.get("status", ""),
+                format_number(row.get("saturation_change_pp"), 2), row.get("status", ""), row.get("message", ""),
             ))
             self.auxiliary_tree.insert("", "end", values=(
                 row.get("scheme_name", ""),
@@ -609,6 +791,7 @@ class BoneIQAApp(tk.Tk):
                 format_number(row.get("mean_intensity")), format_number(row.get("std_intensity")), format_number(row.get("average_gradient_roi")),
                 format_number(row.get("cnr_background")), format_number(row.get("cnr_local")),
                 format_number(None if row.get("saturation_ratio") is None else row["saturation_ratio"] * 100, 2), row.get("status", ""),
+                row.get("message") or row.get("cnr_background_reason") or row.get("cnr_local_reason") or row.get("saturation_reason", ""),
             ))
 
     def _fill_validation(self, rows):

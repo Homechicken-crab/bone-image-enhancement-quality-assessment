@@ -175,6 +175,8 @@ class ProjectStore:
     def upsert_roi(self, roi: ROI) -> None:
         if not roi.name.strip():
             raise ProjectError("ROI 名称不能为空")
+        if roi.type in {"weak_bone", "strong_bone"} and not roi.paired_surrounding_roi_id:
+            roi.paired_surrounding_roi_id = nearest_surrounding_roi_id(self.project.rois, roi)
         existing = next((index for index, item in enumerate(self.project.rois) if item.id == roi.id), None)
         if existing is None:
             self.project.rois.append(roi)
@@ -209,3 +211,19 @@ class ProjectStore:
         if evaluation.get("evaluation_id") != self.project.latest_evaluation_id:
             return None
         return evaluation
+
+
+def nearest_surrounding_roi_id(rois: list[ROI], bone_roi: ROI) -> str | None:
+    """Return the only or center-nearest Surrounding ROI for a Bone ROI."""
+    surroundings = [roi for roi in rois if roi.type == "surrounding" and roi.id != bone_roi.id]
+    if not surroundings:
+        return None
+    bone_center = (bone_roi.x + bone_roi.width / 2.0, bone_roi.y + bone_roi.height / 2.0)
+    return min(
+        surroundings,
+        key=lambda roi: (
+            (roi.x + roi.width / 2.0 - bone_center[0]) ** 2
+            + (roi.y + roi.height / 2.0 - bone_center[1]) ** 2,
+            roi.id,
+        ),
+    ).id
