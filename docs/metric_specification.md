@@ -123,7 +123,9 @@ s=\sqrt{\frac{1}{n-1}\sum_{k=1}^{n}(x_k-\bar{x})^2}
 
 ### 5.3 Bone–Surrounding 配对
 
-每个参与 CNR 计算的 `weak_bone` 或 `strong_bone` ROI 必须通过稳定 ID 显式关联一个 `surrounding` ROI。
+每个参与总体 CNR 计算的 `weak_bone` ROI 必须通过稳定 ID 显式关联一个 `surrounding` ROI。
+
+`strong_bone` ROI 的主要用途是强骨骼区域的 Average Gradient 和 Saturation Ratio 检查，第一阶段不要求配对 `surrounding` ROI；固定 `ROI Template v1` 中的强骨骼 ROI 也不带邻域配对。若用户为 Strong Bone 手工建立了有效配对，程序可以计算并保存其 CNR，但该结果仅作为辅助结果。
 
 程序不得根据 ROI 名称、创建顺序或空间距离自动猜测配对关系。
 
