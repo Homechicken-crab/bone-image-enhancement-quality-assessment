@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import tkinter as tk
+from tkinter import font as tkfont
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -32,6 +33,13 @@ ROI_COLORS = {
     "surrounding": "#26c6da",
     "background": "#42a5f5",
 }
+MAX_COMPARISON_SCHEMES = 10
+SUMMARY_THUMBNAIL_SIZE = (60, 96)
+
+
+def comparison_grid_columns(count: int) -> int:
+    """Choose a readable comparison grid without shrinking ten images into one row."""
+    return count if count <= 4 else 3
 
 
 def format_number(value, digits: int = 4) -> str:
@@ -94,6 +102,151 @@ class HeaderTooltip:
         if self.tip is not None:
             self.tip.destroy()
             self.tip = None
+
+
+class HoverTooltip:
+    """Tooltip for a normal label, used by the scrollable summary header."""
+
+    def __init__(self, widget: tk.Misc, text: str):
+        self.widget = widget
+        self.text = text
+        self.tip: tk.Toplevel | None = None
+        self.after_id: str | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+
+    def _schedule(self, event):
+        self.hide()
+        self.after_id = self.widget.after(450, lambda: self.show(event.x_root + 12, event.y_root + 12))
+
+    def show(self, x: int, y: int):
+        self.after_id = None
+        if self.tip is not None:
+            return
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.attributes("-topmost", True)
+        self.tip.geometry(f"+{x}+{y}")
+        ttk.Label(self.tip, text=self.text, justify="left", wraplength=380, padding=8, relief="solid", borderwidth=1).pack()
+
+    def hide(self, _event=None):
+        if self.after_id is not None:
+            self.widget.after_cancel(self.after_id)
+            self.after_id = None
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+
+class MetricSummaryTable:
+    """Scrollable widget table with real thumbnail cells and a shared header."""
+
+    COLUMNS = (
+        ("结果图", 88), ("比较", 60), ("方案", 150), ("Local CNR", 112), ("Local Δ%", 105),
+        ("Background CNR", 132), ("Background Δ%", 126), ("Weak AG", 105), ("AG Δ%", 95),
+        ("Noise", 100), ("Noise Δ%", 108), ("SSIM", 95), ("Strong Sat.%", 118), ("Sat. Δpp", 108),
+        ("All CNR-bg", 118), ("All CNR-local", 128), ("Strong CNR-bg", 128), ("Strong CNR-local", 138),
+        ("Global AG", 110), ("Strong AG", 110), ("状态", 230),
+    )
+
+    def __init__(self, parent, on_row_click, on_compare_click, on_preview):
+        self.on_row_click = on_row_click
+        self.on_compare_click = on_compare_click
+        self.on_preview = on_preview
+        self.frame = ttk.Frame(parent)
+        self.frame.rowconfigure(1, weight=1)
+        self.frame.columnconfigure(0, weight=1)
+        self.header_canvas = tk.Canvas(self.frame, height=32, highlightthickness=0, background="#e8e8e8")
+        self.body_canvas = tk.Canvas(self.frame, highlightthickness=0, background="#ffffff")
+        self.xscroll = ttk.Scrollbar(self.frame, orient="horizontal", command=self._xview)
+        self.yscroll = ttk.Scrollbar(self.frame, orient="vertical", command=self.body_canvas.yview)
+        self.header_canvas.configure(xscrollcommand=self._header_xscroll, yscrollcommand=lambda *_: None)
+        self.body_canvas.configure(xscrollcommand=self._body_xscroll, yscrollcommand=self.yscroll.set)
+        self.header_canvas.grid(row=0, column=0, sticky="ew")
+        self.body_canvas.grid(row=1, column=0, sticky="nsew")
+        self.yscroll.grid(row=1, column=1, sticky="ns")
+        self.xscroll.grid(row=2, column=0, sticky="ew")
+        self.header_inner = ttk.Frame(self.header_canvas)
+        self.body_inner = ttk.Frame(self.body_canvas)
+        total_width = sum(width for _heading, width in self.COLUMNS)
+        self.header_inner.configure(width=total_width)
+        self.body_inner.configure(width=total_width)
+        self.header_window = self.header_canvas.create_window((0, 0), window=self.header_inner, anchor="nw")
+        self.body_window = self.body_canvas.create_window((0, 0), window=self.body_inner, anchor="nw")
+        self.header_inner.bind("<Configure>", self._update_scrollregions, add="+")
+        self.body_inner.bind("<Configure>", self._update_scrollregions, add="+")
+        self.body_canvas.bind("<Configure>", self._body_configure, add="+")
+        self.header_canvas.bind("<Configure>", self._header_configure, add="+")
+        self.row_widgets: dict[str, dict[str, tk.Misc]] = {}
+        self._build_header()
+
+    def _build_header(self):
+        for index, (heading, width) in enumerate(self.COLUMNS):
+            self.header_inner.columnconfigure(index, minsize=width, weight=0)
+            label = tk.Label(self.header_inner, text=heading, width=max(1, width // 8), anchor="center", background="#e8e8e8", relief="groove", borderwidth=1, font=("Microsoft YaHei UI", 9, "bold"))
+            label.grid(row=0, column=index, sticky="nsew")
+            tooltip = METRIC_TOOLTIPS.get(heading)
+            if heading == "Sat. Δpp":
+                tooltip = METRIC_TOOLTIPS["Sat. Δpp"]
+            elif tooltip is None and "Δ" in heading:
+                tooltip = METRIC_TOOLTIPS["Δ%"]
+            if tooltip:
+                HoverTooltip(label, tooltip)
+
+    def _body_configure(self, event):
+        self.body_canvas.itemconfigure(self.body_window, height=max(event.height, self.body_inner.winfo_reqheight()))
+        self._update_scrollregions()
+
+    def _header_configure(self, event):
+        self.header_canvas.itemconfigure(self.header_window, height=max(event.height, 32))
+        self._update_scrollregions()
+
+    def _update_scrollregions(self, _event=None):
+        self.header_canvas.configure(scrollregion=self.header_canvas.bbox("all"))
+        self.body_canvas.configure(scrollregion=self.body_canvas.bbox("all"))
+
+    def _xview(self, *args):
+        self.header_canvas.xview(*args)
+        self.body_canvas.xview(*args)
+
+    def _header_xscroll(self, first, last):
+        self.xscroll.set(first, last)
+
+    def _body_xscroll(self, first, last):
+        self.xscroll.set(first, last)
+        self.header_canvas.xview_moveto(first)
+
+    def clear(self):
+        for widgets in self.row_widgets.values():
+            widgets["frame"].destroy()
+        self.row_widgets.clear()
+        self._update_scrollregions()
+
+    def add_row(self, row_id: str, thumbnail, values: tuple[str, ...], compared: bool):
+        row = ttk.Frame(self.body_inner, height=110)
+        row.grid(row=len(self.row_widgets), column=0, sticky="ew")
+        row.grid_propagate(False)
+        for index, (_heading, width) in enumerate(self.COLUMNS):
+            row.columnconfigure(index, minsize=width, weight=0)
+        image_label = ttk.Label(row, image=thumbnail, anchor="center")
+        image_label.image = thumbnail
+        image_label.grid(row=0, column=0, sticky="nsew", padx=2, pady=5)
+        image_label.bind("<Button-1>", lambda _event, rid=row_id: self.on_row_click(rid))
+        image_label.bind("<Double-1>", lambda _event, rid=row_id: self.on_preview(rid))
+        compare_label = ttk.Label(row, text="☑" if compared else "☐", anchor="center", font=("Segoe UI Symbol", 15))
+        compare_label.grid(row=0, column=1, sticky="nsew")
+        compare_label.bind("<Button-1>", lambda _event, rid=row_id: self.on_compare_click(rid))
+        for index, value in enumerate(values, start=2):
+            label = ttk.Label(row, text=value, anchor="center" if index != 2 and index != len(self.COLUMNS) - 1 else "w", justify="left", wraplength=self.COLUMNS[index][1] - 8)
+            label.grid(row=0, column=index, sticky="nsew", padx=2)
+            label.bind("<Button-1>", lambda _event, rid=row_id: self.on_row_click(rid))
+        self.row_widgets[row_id] = {"frame": row, "compare": compare_label}
+        self._update_scrollregions()
+
+    def set_compared(self, row_id: str, compared: bool):
+        widgets = self.row_widgets.get(row_id)
+        if widgets:
+            widgets["compare"].configure(text="☑" if compared else "☐")
 
 
 class ImagePreviewWindow(tk.Toplevel):
@@ -164,10 +317,19 @@ class ImagePreviewWindow(tk.Toplevel):
 
 
 class ComparisonWindow(tk.Toplevel):
+    METRIC_ROWS = (
+        ("Local CNR", "weak_bone_mean_cnr_local"), ("Local Δ%", "local_cnr_change_percent"),
+        ("Background CNR", "weak_bone_mean_cnr_background"), ("Background Δ%", "background_cnr_change_percent"),
+        ("Weak AG", "weak_bone_mean_average_gradient"), ("AG Δ%", "weak_ag_change_percent"),
+        ("Noise", "background_noise_pooled"), ("Noise Δ%", "background_noise_change_percent"),
+        ("SSIM", "ssim"), ("Strong Sat.%", "strong_bone_saturation_mean"), ("Sat. Δpp", "saturation_change_pp"),
+    )
+
     def __init__(self, parent, store: ProjectStore, result: dict, scheme_ids: list[str]):
         super().__init__(parent)
         self.title("方案比较")
-        self.geometry("1250x800")
+        self.geometry("1280x820")
+        self.minsize(900, 620)
         self.store = store
         self.result = result
         self.scheme_ids = scheme_ids
@@ -175,19 +337,22 @@ class ComparisonWindow(tk.Toplevel):
         self.names: list[str] = []
         self.zoom = 1.0
         self.center = (0.5, 0.5)
-        self.photos: list[ImageTk.PhotoImage | None] = []
         self.canvases: list[tk.Canvas] = []
+        self.drag_start = None
         records = ([store.project.original] if store.project.original else []) + store.project.algorithms
         by_id = {record.id: record for record in records}
         for scheme_id in scheme_ids:
-            record = by_id[scheme_id]
+            record = by_id.get(scheme_id)
+            if record is None:
+                continue
             self.names.append(record.display_name)
             try:
                 self.images.append(Image.open(store.resolve(record.relative_path)).convert("L"))
             except Exception:
                 self.images.append(Image.new("L", (500, 800), 0))
-        toolbar = ttk.Frame(self)
-        toolbar.pack(fill="x", padx=8, pady=6)
+
+        toolbar = ttk.Frame(self, padding=6)
+        toolbar.pack(fill="x")
         ttk.Button(toolbar, text="恢复全部视图", command=self.reset_view).pack(side="left", padx=2)
         roi_names = [roi.name for roi in store.project.rois if roi.type in {"weak_bone", "strong_bone"}]
         self.roi_var = tk.StringVar()
@@ -195,78 +360,78 @@ class ComparisonWindow(tk.Toplevel):
         self.roi_combo.pack(side="left", padx=8)
         ttk.Button(toolbar, text="定位 ROI", command=self.focus_roi).pack(side="left", padx=2)
         ttk.Button(toolbar, text="查看两方案差异图", command=self.show_difference).pack(side="left", padx=2)
-        self.image_frame = ttk.Frame(self)
-        self.image_frame.pack(fill="both", expand=True, padx=8, pady=4)
-        self.image_frame.rowconfigure(0, weight=1)
-        for index, name in enumerate(self.names):
-            self.image_frame.columnconfigure(index, weight=1)
-            frame = ttk.Frame(self.image_frame)
-            frame.grid(row=0, column=index, sticky="nsew", padx=3)
-            frame.rowconfigure(0, weight=1)
-            frame.columnconfigure(0, weight=1)
-            canvas = tk.Canvas(frame, background="#111", highlightthickness=0)
-            canvas.grid(row=0, column=0, sticky="nsew")
-            ttk.Label(frame, text=name, anchor="center").grid(row=1, column=0, sticky="ew", pady=(3, 0))
-            canvas.bind("<Configure>", lambda _event: self.render())
-            canvas.bind("<MouseWheel>", self._wheel)
-            canvas.bind("<ButtonPress-1>", self._press)
-            canvas.bind("<B1-Motion>", self._drag)
-            self.canvases.append(canvas)
-        self.drag_start = None
-        self.data_frame = ttk.Frame(self)
-        self.data_tree = self._build_data_tree()
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack_forget()
-        # Put both views in a notebook after the canvases have been created.
-        self._rebuild_as_notebook(toolbar)
-        self.after(50, self.render)
 
-    def _rebuild_as_notebook(self, toolbar):
-        self.image_frame.pack_forget()
-        self.data_frame.pack_forget()
+        self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=8, pady=4)
         image_tab = ttk.Frame(self.notebook)
         image_tab.rowconfigure(0, weight=1)
         image_tab.columnconfigure(0, weight=1)
-        self.image_frame.pack_forget()
-        self.image_frame = ttk.Frame(image_tab)
-        self.image_frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-        self.image_frame.rowconfigure(0, weight=1)
-        for index, name in enumerate(self.names):
-            self.image_frame.columnconfigure(index, weight=1)
-            frame = ttk.Frame(self.image_frame)
-            frame.grid(row=0, column=index, sticky="nsew", padx=3)
-            frame.rowconfigure(0, weight=1)
-            frame.columnconfigure(0, weight=1)
-            canvas = tk.Canvas(frame, background="#111", highlightthickness=0)
-            canvas.grid(row=0, column=0, sticky="nsew")
-            ttk.Label(frame, text=name, anchor="center").grid(row=1, column=0, sticky="ew", pady=(3, 0))
-            canvas.bind("<Configure>", lambda _event: self.render())
-            canvas.bind("<MouseWheel>", self._wheel)
-            canvas.bind("<ButtonPress-1>", self._press)
-            canvas.bind("<B1-Motion>", self._drag)
-            self.canvases[index] = canvas
         self.notebook.add(image_tab, text="图像比较")
-        self.notebook.add(self.data_frame, text="数据比较")
-        self.data_frame.pack_forget()
+        self._build_image_grid(image_tab)
+        data_tab = ttk.Frame(self.notebook)
+        data_tab.rowconfigure(0, weight=1)
+        data_tab.columnconfigure(0, weight=1)
+        self.notebook.add(data_tab, text="数据比较")
+        self._build_data_tree(data_tab)
+        self.after(80, self.render)
 
-    def _build_data_tree(self):
-        tree = ttk.Treeview(self.data_frame, columns=[str(i) for i in range(len(self.names))], show="tree headings")
+    def _build_image_grid(self, parent):
+        count = len(self.images)
+        columns = comparison_grid_columns(count)
+        cell_width = 300 if columns <= 3 else 270
+        cell_height = 315
+        frame = ttk.Frame(parent)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(frame, background="#d5d5d5", highlightthickness=0)
+        xbar = ttk.Scrollbar(frame, orient="horizontal", command=canvas.xview)
+        ybar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        canvas.configure(xscrollcommand=xbar.set, yscrollcommand=ybar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+        inner = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")), add="+")
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, height=max(event.height, inner.winfo_reqheight())), add="+")
+        for index, (name, image) in enumerate(zip(self.names, self.images)):
+            row, column = divmod(index, columns)
+            cell = ttk.Frame(inner, width=cell_width, height=cell_height, padding=4)
+            cell.grid(row=row, column=column, sticky="nw", padx=5, pady=5)
+            cell.grid_propagate(False)
+            cell.rowconfigure(0, weight=1)
+            cell.columnconfigure(0, weight=1)
+            view = tk.Canvas(cell, width=cell_width - 12, height=cell_height - 42, background="#111", highlightthickness=0)
+            view.grid(row=0, column=0, sticky="nsew")
+            ttk.Label(cell, text=name, anchor="center", wraplength=cell_width - 10).grid(row=1, column=0, sticky="ew", pady=(3, 0))
+            view.bind("<Configure>", lambda _event: self.render(), add="+")
+            view.bind("<MouseWheel>", self._wheel, add="+")
+            view.bind("<ButtonPress-1>", self._press, add="+")
+            view.bind("<B1-Motion>", self._drag, add="+")
+            self.canvases.append(view)
+
+    def _build_data_tree(self, parent):
+        columns = [str(index) for index in range(len(self.names))]
+        tree_frame = ttk.Frame(parent)
+        tree_frame.grid(row=0, column=0, sticky="nsew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings")
         tree.heading("#0", text="指标")
-        tree.column("#0", width=190, anchor="w")
+        tree.column("#0", width=190, minwidth=190, anchor="w", stretch=False)
         for index, name in enumerate(self.names):
             key = str(index)
             tree.heading(key, text=name)
-            tree.column(key, width=145, anchor="center")
-        rows = (
-            ("Local CNR", "weak_bone_mean_cnr_local"), ("Local Δ%", "local_cnr_change_percent"),
-            ("Background CNR", "weak_bone_mean_cnr_background"), ("Background Δ%", "background_cnr_change_percent"),
-            ("Weak AG", "weak_bone_mean_average_gradient"), ("AG Δ%", "weak_ag_change_percent"),
-            ("Noise", "background_noise_pooled"), ("Noise Δ%", "background_noise_change_percent"),
-            ("SSIM", "ssim"), ("Strong Sat.%", "strong_bone_saturation_mean"), ("Sat. Δpp", "saturation_change_pp"),
-        )
+            tree.column(key, width=155, minwidth=125, anchor="center", stretch=False)
+        ybar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        xbar = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
         by_id = {row.get("scheme_id"): row for row in self.result.get("metrics", [])}
-        for label, key in rows:
+        for label, key in self.METRIC_ROWS:
             values = []
             for scheme_id in self.scheme_ids:
                 value = by_id.get(scheme_id, {}).get(key)
@@ -274,9 +439,8 @@ class ComparisonWindow(tk.Toplevel):
                     value *= 100
                 values.append(format_number(value, 2 if "Δ" in label or "Sat" in label else 4))
             tree.insert("", "end", text=label, values=values)
-        tree.pack(fill="both", expand=True, padx=6, pady=6)
         HeaderTooltip(tree, METRIC_TOOLTIPS)
-        return tree
+        self.data_tree = tree
 
     def reset_view(self):
         self.zoom, self.center = 1.0, (0.5, 0.5)
@@ -290,17 +454,20 @@ class ComparisonWindow(tk.Toplevel):
         self.drag_start = (event.x, event.y, self.center)
 
     def _drag(self, event):
-        if not self.drag_start:
+        if not self.drag_start or not self.canvases:
             return
         x0, y0, (cx, cy) = self.drag_start
         canvas = self.canvases[0]
-        self.center = (min(1.0, max(0.0, cx - (event.x - x0) / max(canvas.winfo_width(), 1) / self.zoom)), min(1.0, max(0.0, cy - (event.y - y0) / max(canvas.winfo_height(), 1) / self.zoom)))
+        self.center = (
+            min(1.0, max(0.0, cx - (event.x - x0) / max(canvas.winfo_width(), 1) / self.zoom)),
+            min(1.0, max(0.0, cy - (event.y - y0) / max(canvas.winfo_height(), 1) / self.zoom)),
+        )
         self.render()
 
     def focus_roi(self):
         name = self.roi_var.get()
         roi = next((roi for roi in self.store.project.rois if roi.name == name), None)
-        if roi is None:
+        if roi is None or not self.images:
             return
         width, height = self.images[0].size
         self.center = ((roi.x + roi.width / 2) / width, (roi.y + roi.height / 2) / height)
@@ -335,6 +502,9 @@ class ComparisonWindow(tk.Toplevel):
             return
         first = np.asarray(self.images[0], dtype=np.float32)
         second = np.asarray(self.images[1], dtype=np.float32)
+        if first.shape != second.shape:
+            messagebox.showwarning("差异图", "两个方案尺寸不一致，不能生成差异图。", parent=self)
+            return
         difference = np.abs(first - second)
         peak = float(difference.max())
         if peak > 0:
@@ -359,6 +529,7 @@ class BoneIQAApp(tk.Tk):
         self.roi_recommendations: list[ROIRecommendation] = []
         self._summary_thumbnail_refs: dict[str, ImageTk.PhotoImage] = {}
         self._comparison_selected_ids: set[str] = set()
+        self._selected_summary_scheme_id: str | None = None
         self._last_evaluation: dict | None = None
         self._build_menu()
         self._build_ui()
@@ -508,61 +679,36 @@ class BoneIQAApp(tk.Tk):
         result_book = ttk.Notebook(self.evaluate_tab)
         result_book.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         summary_frame = ttk.Frame(result_book)
-        auxiliary_frame = ttk.Frame(result_book)
         roi_frame = ttk.Frame(result_book)
-        validation_frame = ttk.Frame(result_book)
         result_book.add(summary_frame, text="总体表")
-        result_book.add(auxiliary_frame, text="辅助指标")
         result_book.add(roi_frame, text="ROI 表")
-        result_book.add(validation_frame, text="检查结果")
 
         summary_frame.rowconfigure(0, weight=1)
         summary_frame.columnconfigure(0, weight=1)
-        summary_columns = ("compare", "name", "local", "local_change", "background", "background_change", "ag", "ag_change", "noise", "noise_change", "ssim", "sat", "sat_change", "status")
-        self.summary_tree = ttk.Treeview(summary_frame, columns=summary_columns, show="tree headings", selectmode="browse")
-        self.summary_tree.heading("#0", text="结果图")
-        self.summary_tree.column("#0", width=90, anchor="center", stretch=False)
-        summary_headers = {
-            "compare": "比较", "name": "方案", "local": "Local CNR", "local_change": "Local Δ%",
-            "background": "Background CNR", "background_change": "Background Δ%", "ag": "Weak AG",
-            "ag_change": "AG Δ%", "noise": "Noise", "noise_change": "Noise Δ%", "ssim": "SSIM",
-            "sat": "Strong Sat.%", "sat_change": "Sat. Δpp", "status": "状态",
-        }
-        for key in summary_columns:
-            self.summary_tree.heading(key, text=summary_headers[key])
-            self.summary_tree.column(key, width=120 if key == "name" else 105 if key == "compare" else 100, anchor="w" if key == "name" else "center")
-        self.summary_tree.grid(row=0, column=0, sticky="nsew")
-        self.summary_tree.bind("<Button-1>", self._summary_tree_click)
-        HeaderTooltip(self.summary_tree, METRIC_TOOLTIPS)
+        self.summary_table = MetricSummaryTable(summary_frame, self._summary_row_click, self._summary_compare_click, self._summary_preview)
+        self.summary_table.frame.grid(row=0, column=0, sticky="nsew")
         diagnostic_frame = ttk.LabelFrame(summary_frame, text="指标解释 / 诊断", padding=6)
         diagnostic_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        self.diagnostic_var = tk.StringVar(value="评价完成后，这里显示基于指标组合的客观描述；不会生成综合评分或推荐排名。")
+        self.diagnostic_var = tk.StringVar(value="请完成评价后点击总体表中的某个方案，查看该方案的指标诊断。")
         ttk.Label(diagnostic_frame, textvariable=self.diagnostic_var, justify="left", wraplength=1150).pack(fill="x")
 
-        auxiliary_columns = ("name", "all_bg", "all_local", "strong_bg", "strong_local", "global_ag", "strong_ag")
-        self.auxiliary_tree = ttk.Treeview(auxiliary_frame, columns=auxiliary_columns, show="headings")
-        auxiliary_headers = {
-            "name": "方案", "all_bg": "All Bone CNR-bg", "all_local": "All Bone CNR-local",
-            "strong_bg": "Strong CNR-bg", "strong_local": "Strong CNR-local",
-            "global_ag": "Global AG", "strong_ag": "Strong Mean AG",
-        }
-        for key in auxiliary_columns:
-            self.auxiliary_tree.heading(key, text=auxiliary_headers[key])
-            self.auxiliary_tree.column(key, width=150 if key == "name" else 125, anchor="center")
-        self.auxiliary_tree.pack(fill="both", expand=True)
-
         roi_columns = ("scheme", "roi", "type", "mean", "std", "ag", "cnr_bg", "cnr_local", "sat", "status", "message")
-        self.roi_result_tree = ttk.Treeview(roi_frame, columns=roi_columns, show="headings")
+        roi_frame.rowconfigure(0, weight=1)
+        roi_frame.columnconfigure(0, weight=1)
+        roi_table_frame = ttk.Frame(roi_frame)
+        roi_table_frame.grid(row=0, column=0, sticky="nsew")
+        roi_table_frame.rowconfigure(0, weight=1)
+        roi_table_frame.columnconfigure(0, weight=1)
+        self.roi_result_tree = ttk.Treeview(roi_table_frame, columns=roi_columns, show="headings")
         for key, label in zip(roi_columns, ("方案", "ROI", "类型", "均值", "标准差", "AG", "CNR-bg", "CNR-local", "饱和率", "状态", "原因")):
             self.roi_result_tree.heading(key, text=label)
-            self.roi_result_tree.column(key, width=280 if key == "message" else 115 if key in {"scheme", "roi"} else 88, anchor="w" if key == "message" else "center")
-        self.roi_result_tree.pack(fill="both", expand=True)
-
-        self.validation_tree = ttk.Treeview(validation_frame, columns=("severity", "object", "message"), show="headings")
-        for key, label, width in (("severity", "级别", 80), ("object", "对象", 160), ("message", "说明", 700)):
-            self.validation_tree.heading(key, text=label)
-            self.validation_tree.column(key, width=width, anchor="w")
-        self.validation_tree.pack(fill="both", expand=True)
+            self.roi_result_tree.column(key, width=300 if key == "message" else 125 if key in {"scheme", "roi"} else 92, minwidth=70, anchor="w" if key == "message" else "center", stretch=False)
+        roi_ybar = ttk.Scrollbar(roi_table_frame, orient="vertical", command=self.roi_result_tree.yview)
+        roi_xbar = ttk.Scrollbar(roi_table_frame, orient="horizontal", command=self.roi_result_tree.xview)
+        self.roi_result_tree.configure(yscrollcommand=roi_ybar.set, xscrollcommand=roi_xbar.set)
+        self.roi_result_tree.grid(row=0, column=0, sticky="nsew")
+        roi_ybar.grid(row=0, column=1, sticky="ns")
+        roi_xbar.grid(row=1, column=0, sticky="ew")
 
     def _require_store(self) -> ProjectStore | None:
         if self.store is None:
@@ -952,10 +1098,14 @@ class BoneIQAApp(tk.Tk):
         if not store:
             return
         issues = validate_project(store)
-        self._fill_validation([issue.to_dict() for issue in issues])
-        self.notebook.select(self.evaluate_tab)
         if not issues:
+            self._set_status("检查通过：未发现图像、ROI 或配对问题")
             messagebox.showinfo("检查完成", "未发现问题。")
+            return
+        severity_labels = {"error": "错误", "warning": "警告", "info": "提示"}
+        summary = "\n".join(f"[{severity_labels.get(issue.severity, issue.severity)}] {issue.message}" for issue in issues)
+        self._set_status(f"检查发现 {len(issues)} 项问题：{issues[0].message}")
+        messagebox.showwarning("检查发现问题", summary)
 
     def run_evaluation(self):
         store = self._require_store()
@@ -967,7 +1117,11 @@ class BoneIQAApp(tk.Tk):
             result = evaluate_project(store)
             self._fill_results(result)
             self.notebook.select(self.evaluate_tab)
-            self._set_status(f"评价完成：{result['evaluation_id']}")
+            warning_count = sum(1 for row in result.get("metrics", []) if row.get("status") in {"partial", "valid_with_warnings", "failed"})
+            if warning_count:
+                self._set_status(f"评价完成，但有 {warning_count} 个方案需要检查状态列")
+            else:
+                self._set_status(f"评价完成：{result['evaluation_id']}")
         except Exception as exc:
             self._set_status("评价失败")
             messagebox.showerror("评价失败", str(exc))
@@ -1030,14 +1184,16 @@ class BoneIQAApp(tk.Tk):
             return
         issues = validate_project(self.store)
         error_ids = {issue.object_id for issue in issues if issue.severity == "error"}
+        evaluation_expired = self.store.evaluation_status() == "expired"
         records = ([self.store.project.original] if self.store.project.original else []) + self.store.project.algorithms
         for record in records:
+            record_status = "结果已过期" if evaluation_expired else "通过"
             self.image_tree.insert("", "end", iid=record.id, values=(
                 "原图" if record.role == "original" else "算法",
                 record.display_name,
                 f"{record.width} × {record.height}",
                 record.dtype,
-                "错误" if record.id in error_ids else "通过",
+                "错误" if record.id in error_ids else record_status,
                 record.relative_path,
             ))
 
@@ -1090,10 +1246,11 @@ class BoneIQAApp(tk.Tk):
             all_rois = formal + recommended
             labels = self._short_roi_labels(all_rois)
             highlighted = self._linked_highlight_ids(all_rois)
+            label_positions, label_fonts = self._layout_roi_labels(canvas, all_rois, labels, ox, oy, scale, highlighted)
             for roi in formal:
-                self._draw_roi(canvas, roi, labels[roi.id], ox, oy, scale, roi.id in highlighted, recommended=False)
+                self._draw_roi(canvas, roi, labels[roi.id], ox, oy, scale, roi.id in highlighted, recommended=False, label_position=label_positions[roi.id], label_font=label_fonts[roi.id])
             for roi in recommended:
-                self._draw_roi(canvas, roi, labels[roi.id], ox, oy, scale, roi.id in highlighted, recommended=True)
+                self._draw_roi(canvas, roi, labels[roi.id], ox, oy, scale, roi.id in highlighted, recommended=True, label_position=label_positions[roi.id], label_font=label_fonts[roi.id])
             legend = "弱骨骼 ｜ 强骨骼 ｜ 邻域 ｜ 背景"
             canvas.create_rectangle(8, 8, 315, 32, fill="#111", outline="#888")
             canvas.create_text(16, 20, text=legend, fill="white", anchor="w", font=("Microsoft YaHei UI", 9))
@@ -1123,7 +1280,50 @@ class BoneIQAApp(tk.Tk):
             highlighted.update(roi.id for roi in rois if roi.paired_surrounding_roi_id == selected.id)
         return highlighted
 
-    def _draw_roi(self, canvas, roi: ROI, label: str, ox: float, oy: float, scale: float, highlighted: bool, recommended: bool):
+    def _layout_roi_labels(self, canvas, rois: list[ROI], labels: dict[str, str], ox: float, oy: float, scale: float, highlighted: set[str]):
+        """Place labels around rectangles without changing any ROI geometry."""
+        compact = len(rois) > 8
+        fonts = {
+            roi.id: tkfont.Font(family="Microsoft YaHei UI", size=8 if compact else 9, weight="bold" if roi.id in highlighted else "normal")
+            for roi in rois
+        }
+        canvas_width = max(canvas.winfo_width(), 400)
+        canvas_height = max(canvas.winfo_height(), 400)
+        occupied: list[tuple[float, float, float, float]] = []
+        positions: dict[str, tuple[float, float]] = {}
+
+        def overlaps(candidate, other):
+            return not (candidate[2] <= other[0] or candidate[0] >= other[2] or candidate[3] <= other[1] or candidate[1] >= other[3])
+
+        for roi in sorted(rois, key=lambda item: (item.id not in highlighted, item.y, item.x)):
+            x1, y1 = ox + roi.x * scale, oy + roi.y * scale
+            x2, y2 = ox + (roi.x + roi.width) * scale, oy + (roi.y + roi.height) * scale
+            font = fonts[roi.id]
+            text_width = max(20, font.measure(labels[roi.id]))
+            text_height = max(14, int(font.metrics("linespace")))
+            candidates = (
+                (x1, y1 - text_height - 4),
+                (x2 + 4, y1),
+                (x1 - text_width - 4, y1),
+                (x1, y2 + 4),
+                (x1 + 3, y1 + 3),
+            )
+            chosen = None
+            for candidate_x, candidate_y in candidates:
+                candidate_x = min(max(4, candidate_x), max(4, canvas_width - text_width - 4))
+                candidate_y = min(max(4, candidate_y), max(4, canvas_height - text_height - 4))
+                candidate = (candidate_x, candidate_y, candidate_x + text_width + 4, candidate_y + text_height + 3)
+                if not any(overlaps(candidate, previous) for previous in occupied):
+                    chosen = candidate
+                    break
+            if chosen is None:
+                chosen = (min(max(4, x1), max(4, canvas_width - text_width - 4)), min(max(4, y1), max(4, canvas_height - text_height - 4)), 0, 0)
+                chosen = (chosen[0], chosen[1], chosen[0] + text_width + 4, chosen[1] + text_height + 3)
+            occupied.append(chosen)
+            positions[roi.id] = (chosen[0] + 2, chosen[1] + 1)
+        return positions, fonts
+
+    def _draw_roi(self, canvas, roi: ROI, label: str, ox: float, oy: float, scale: float, highlighted: bool, recommended: bool, label_position=None, label_font=None):
         x1, y1 = ox + roi.x * scale, oy + roi.y * scale
         x2, y2 = ox + (roi.x + roi.width) * scale, oy + (roi.y + roi.height) * scale
         any_selection = bool(self._selected_roi_id or self._selected_recommendation_id)
@@ -1133,7 +1333,16 @@ class BoneIQAApp(tk.Tk):
         if recommended:
             options["dash"] = (6, 4)
         canvas.create_rectangle(x1, y1, x2, y2, **options)
-        canvas.create_text(x1 + 3, y1 + 3, text=label, fill=color, anchor="nw", font=("Microsoft YaHei UI", 10, "bold" if highlighted else "normal"))
+        if label_position is not None:
+            font = label_font or ("Microsoft YaHei UI", 9, "bold" if highlighted else "normal")
+            label_x, label_y = label_position
+            if isinstance(font, tkfont.Font):
+                text_width = font.measure(label)
+                text_height = int(font.metrics("linespace"))
+            else:
+                text_width, text_height = 64, 16
+            canvas.create_rectangle(label_x - 2, label_y - 1, label_x + text_width + 2, label_y + text_height + 2, fill="#111", outline="")
+            canvas.create_text(label_x, label_y, text=label, fill=color, anchor="nw", font=font)
 
     def _record_for_id(self, scheme_id: str):
         if not self.store:
@@ -1142,46 +1351,43 @@ class BoneIQAApp(tk.Tk):
         return next((record for record in records if record.id == scheme_id), None)
 
     def _thumbnail_for_record(self, record):
+        thumbnail_size = SUMMARY_THUMBNAIL_SIZE
         if record is None:
-            thumbnail = ImageTk.PhotoImage(Image.new("L", (70, 110), 80))
+            thumbnail = ImageTk.PhotoImage(Image.new("L", thumbnail_size, 80))
             self._summary_thumbnail_refs["missing"] = thumbnail
             return thumbnail
         try:
             image = Image.open(self.store.resolve(record.relative_path)).convert("L")
-            image.thumbnail((70, 110), Image.Resampling.LANCZOS)
-            canvas = Image.new("L", (70, 110), 32)
-            canvas.paste(image, ((70 - image.width) // 2, (110 - image.height) // 2))
+            image.thumbnail(thumbnail_size, Image.Resampling.LANCZOS)
+            canvas = Image.new("L", thumbnail_size, 32)
+            canvas.paste(image, ((thumbnail_size[0] - image.width) // 2, (thumbnail_size[1] - image.height) // 2))
         except Exception:
-            canvas = Image.new("L", (70, 110), 90)
+            canvas = Image.new("L", thumbnail_size, 90)
         thumbnail = ImageTk.PhotoImage(canvas)
         self._summary_thumbnail_refs[record.id if record else "missing"] = thumbnail
         return thumbnail
 
-    def _summary_tree_click(self, event):
-        row_id = self.summary_tree.identify_row(event.y)
-        column = self.summary_tree.identify_column(event.x)
-        if not row_id:
-            return
-        if column == "#0":
-            self._summary_tree_double_click(event)
-            return "break"
-        if column != "#1":
-            return
-        if row_id in self._comparison_selected_ids:
-            self._comparison_selected_ids.remove(row_id)
-        else:
-            self._comparison_selected_ids.add(row_id)
-        values = list(self.summary_tree.item(row_id, "values"))
-        if values:
-            values[0] = "☑" if row_id in self._comparison_selected_ids else "☐"
-            self.summary_tree.item(row_id, values=values)
-        return "break"
+    def _summary_row(self, scheme_id: str):
+        result = self._last_evaluation or {}
+        return next((row for row in result.get("metrics", []) if row.get("scheme_id") == scheme_id), None)
 
-    def _summary_tree_double_click(self, event):
-        row_id = self.summary_tree.identify_row(event.y)
-        if not row_id:
-            return
-        record = self._record_for_id(row_id)
+    def _summary_row_click(self, scheme_id: str):
+        self._selected_summary_scheme_id = scheme_id
+        row = self._summary_row(scheme_id)
+        if row is not None:
+            self.diagnostic_var.set(self._diagnostic_for_row(row))
+            self._set_status(f"已选择方案：{row.get('scheme_name', scheme_id)}")
+
+    def _summary_compare_click(self, scheme_id: str):
+        if scheme_id in self._comparison_selected_ids:
+            self._comparison_selected_ids.remove(scheme_id)
+        else:
+            self._comparison_selected_ids.add(scheme_id)
+        self.summary_table.set_compared(scheme_id, scheme_id in self._comparison_selected_ids)
+        self._set_status(f"已选择 {len(self._comparison_selected_ids)} 个比较方案（最多 10 个）")
+
+    def _summary_preview(self, scheme_id: str):
+        record = self._record_for_id(scheme_id)
         if record is None or self.store is None:
             return
         try:
@@ -1194,27 +1400,31 @@ class BoneIQAApp(tk.Tk):
     def compare_selected_schemes(self):
         if not self.store:
             return
+        if self.store.evaluation_status() == "expired":
+            self._show_expired_evaluation("检测到图像文件或 ROI 配置已发生变化，请重新评价。")
+            messagebox.showwarning("结果已过期", "图像或 ROI 已改变，当前评价结果不能继续用于比较。", parent=self)
+            return
         result = self._last_evaluation or self.store.load_latest_evaluation()
+        if not result:
+            messagebox.showwarning("尚无评价结果", "请先完成一次评价。", parent=self)
+            return
         selected = [row.get("scheme_id") for row in (result or {}).get("metrics", []) if row.get("scheme_id") in self._comparison_selected_ids]
         if len(selected) < 2:
             messagebox.showinfo("方案比较", "请至少选择两个方案。", parent=self)
             return
-        if len(selected) > 4:
-            messagebox.showinfo("方案比较", "最多同时比较 4 个方案。", parent=self)
-            return
-        if not result:
-            messagebox.showwarning("尚无评价结果", "请先完成一次评价。", parent=self)
+        if len(selected) > MAX_COMPARISON_SCHEMES:
+            messagebox.showinfo("方案比较", f"最多同时比较 {MAX_COMPARISON_SCHEMES} 个方案。", parent=self)
             return
         ComparisonWindow(self, self.store, result, selected)
 
     def _show_expired_evaluation(self, message: str):
         self._last_evaluation = None
         self._comparison_selected_ids.clear()
-        self.summary_tree.delete(*self.summary_tree.get_children())
-        self.auxiliary_tree.delete(*self.auxiliary_tree.get_children())
+        self._selected_summary_scheme_id = None
+        self.summary_table.clear()
         self.roi_result_tree.delete(*self.roi_result_tree.get_children())
         self.diagnostic_var.set(message)
-        self._fill_validation([{"severity": "warning", "object_id": self.store.project.id if self.store else "", "message": message}])
+        self._set_status(message)
 
     @staticmethod
     def _status_label(row: dict) -> str:
@@ -1229,33 +1439,49 @@ class BoneIQAApp(tk.Tk):
             return "计算失败"
         return status or "未知状态"
 
-    def _diagnostic_text(self, result: dict) -> str:
-        rows = [row for row in result.get("metrics", []) if row.get("role") != "original" and row.get("status") != "failed"]
-        lines = []
-        for row in rows:
-            ag_change = row.get("weak_ag_change_percent")
-            noise_change = row.get("background_noise_change_percent")
-            local_change = row.get("local_cnr_change_percent")
-            sat_change = row.get("saturation_change_pp")
-            notes = []
-            if ag_change is not None and noise_change is not None and ag_change > 10 and noise_change > 10:
-                notes.append("边缘和细节增强明显，但部分 AG 提升可能伴随背景噪声放大，建议结合图像观察")
-            if row.get("ssim") is not None and row["ssim"] > 0.95 and ag_change is not None and ag_change < -10:
-                notes.append("处理结果与原图结构接近，但弱骨骼局部梯度下降，可能存在平滑导致的细节损失")
-            if local_change is not None and local_change > 10 and sat_change is not None and sat_change > 5:
-                notes.append("弱骨骼辨识度提高，但强骨骼区域的饱和风险增加")
-            if noise_change is not None and ag_change is not None and noise_change < -10 and ag_change < -10:
-                notes.append("背景波动降低，但同时可能存在过度平滑，需要检查骨骼细节是否损失")
-            if notes:
-                lines.append(f"{row.get('scheme_name', '方案')}：" + "；".join(notes) + "。")
-        return "\n".join(lines) if lines else "当前指标组合未触发预设提示。请结合图像、ROI 明细和数值变化进行客观判断，不使用综合评分。"
+    def _diagnostic_for_row(self, row: dict) -> str:
+        if row.get("role") == "original":
+            return "原图作为变化基准：Local CNR、Background CNR、Weak AG 和 Background Noise 的变化量显示为“—”；SSIM 为 1。"
+        local_change = row.get("local_cnr_change_percent")
+        background_change = row.get("background_cnr_change_percent")
+        ag_change = row.get("weak_ag_change_percent")
+        noise_change = row.get("background_noise_change_percent")
+        ssim = row.get("ssim")
+        sat_change = row.get("saturation_change_pp")
+        notes: list[str] = []
+        if local_change is not None and local_change > 10:
+            notes.append("Local CNR 上升，说明弱骨骼与对应邻域的局部区分度提高")
+        elif local_change is not None and local_change < -10:
+            notes.append("Local CNR 下降，说明弱骨骼与对应参考区域的区分度下降")
+        if background_change is not None and background_change > 10:
+            notes.append("Background CNR 上升，弱骨骼相对体外背景更突出")
+        elif background_change is not None and background_change < -10:
+            notes.append("Background CNR 下降，弱骨骼相对体外背景的突出程度减弱")
+        if ag_change is not None and noise_change is not None and ag_change > 10 and noise_change > 10:
+            notes.append("AG 明显上升且 Noise 也上升，边缘响应增强可能混入噪声贡献")
+        elif ag_change is not None and noise_change is not None and ag_change > 10 and noise_change < -10:
+            notes.append("AG 上升且 Noise 下降，弱骨骼细节增强同时背景更稳定")
+        elif ag_change is not None and ag_change < -10 and ssim is not None and ssim > 0.95:
+            notes.append("AG 下降而 SSIM 较高，结构变化较小但可能存在过度平滑")
+        if sat_change is not None and sat_change > 5:
+            notes.append("Strong Sat.% 相比原图上升，强骨骼区域的饱和风险增加")
+        elif sat_change is not None and sat_change < -5:
+            notes.append("Strong Sat.% 相比原图下降，强骨骼饱和风险减弱")
+        values = (
+            f"Local CNR={format_number(row.get('weak_bone_mean_cnr_local'))}",
+            f"Background CNR={format_number(row.get('weak_bone_mean_cnr_background'))}",
+            f"Weak AG={format_number(row.get('weak_bone_mean_average_gradient'))}",
+            f"Noise={format_number(row.get('background_noise_pooled'))}",
+            f"SSIM={format_number(ssim)}",
+            f"Strong Sat.={format_number(None if row.get('strong_bone_saturation_mean') is None else row['strong_bone_saturation_mean'] * 100, 2)}%",
+        )
+        prefix = f"{row.get('scheme_name', '方案')}：" + "；".join(values) + "。"
+        return prefix + (" " + "；".join(notes) + "。" if notes else " 当前组合未触发预设提示，请结合图像和 ROI 明细判断。")
 
     def _fill_results(self, result):
         self._last_evaluation = result
-        self.summary_tree.delete(*self.summary_tree.get_children())
-        self.auxiliary_tree.delete(*self.auxiliary_tree.get_children())
+        self.summary_table.clear()
         self.roi_result_tree.delete(*self.roi_result_tree.get_children())
-        self._fill_validation(result.get("validation", []))
         self._summary_thumbnail_refs.clear()
         valid_ids = {row.get("scheme_id") for row in result.get("metrics", [])}
         self._comparison_selected_ids.intersection_update(valid_ids)
@@ -1263,41 +1489,38 @@ class BoneIQAApp(tk.Tk):
             record = self._record_for_id(row.get("scheme_id", ""))
             thumbnail = self._thumbnail_for_record(record)
             status = self._status_label(row)
-            if row.get("message") and status not in {"计算正常", "计算正常（有警告）"}:
+            if row.get("message"):
                 status += "：" + str(row["message"])
-            self.summary_tree.insert("", "end", iid=row.get("scheme_id"), image=thumbnail, values=(
-                "☑" if row.get("scheme_id") in self._comparison_selected_ids else "☐",
+            values = (
                 row.get("scheme_name", ""), format_number(row.get("weak_bone_mean_cnr_local")),
                 format_number(row.get("local_cnr_change_percent"), 2), format_number(row.get("weak_bone_mean_cnr_background")),
                 format_number(row.get("background_cnr_change_percent"), 2), format_number(row.get("weak_bone_mean_average_gradient")),
                 format_number(row.get("weak_ag_change_percent"), 2), format_number(row.get("background_noise_pooled")),
                 format_number(row.get("background_noise_change_percent"), 2), format_number(row.get("ssim")),
                 format_number(None if row.get("strong_bone_saturation_mean") is None else row["strong_bone_saturation_mean"] * 100, 2),
-                format_number(row.get("saturation_change_pp"), 2), status,
-            ))
-            self.auxiliary_tree.insert("", "end", values=(
-                row.get("scheme_name", ""),
+                format_number(row.get("saturation_change_pp"), 2),
                 format_number(row.get("all_bone_mean_cnr_background")),
                 format_number(row.get("all_bone_mean_cnr_local")),
                 format_number(row.get("strong_bone_mean_cnr_background")),
                 format_number(row.get("strong_bone_mean_cnr_local")),
                 format_number(row.get("average_gradient_global")),
                 format_number(row.get("strong_bone_mean_average_gradient")),
-            ))
+                status,
+            )
+            self.summary_table.add_row(row.get("scheme_id"), thumbnail, values, row.get("scheme_id") in self._comparison_selected_ids)
         for row in result.get("roi_metrics", []):
             self.roi_result_tree.insert("", "end", values=(
                 row.get("scheme_name", ""), row.get("roi_name", ""), ROI_LABELS.get(row.get("roi_type"), row.get("roi_type", "")),
                 format_number(row.get("mean_intensity")), format_number(row.get("std_intensity")), format_number(row.get("average_gradient_roi")),
                 format_number(row.get("cnr_background")), format_number(row.get("cnr_local")),
-                format_number(None if row.get("saturation_ratio") is None else row["saturation_ratio"] * 100, 2), row.get("status", ""),
+                format_number(None if row.get("saturation_ratio") is None else row["saturation_ratio"] * 100, 2), self._status_label(row),
                 row.get("message") or row.get("cnr_background_reason") or row.get("cnr_local_reason") or row.get("saturation_reason", ""),
             ))
-        self.diagnostic_var.set(self._diagnostic_text(result))
-
-    def _fill_validation(self, rows):
-        self.validation_tree.delete(*self.validation_tree.get_children())
-        for row in rows:
-            self.validation_tree.insert("", "end", values=(row.get("severity", ""), row.get("object_id", ""), row.get("message", "")))
+        self._selected_summary_scheme_id = None
+        self.diagnostic_var.set("请点击总体表中的某个方案，查看该方案的指标诊断。")
+        warnings = [issue.get("message", "") for issue in result.get("validation", []) if issue.get("severity") in {"warning", "error"}]
+        if warnings:
+            self._set_status("评价完成：" + warnings[0])
 
 
 def main() -> int:
