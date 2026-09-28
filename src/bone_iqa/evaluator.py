@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import platform
 from dataclasses import asdict
@@ -13,7 +14,7 @@ import numpy as np
 import PIL
 
 from . import METRIC_SPEC_VERSION, __version__
-from .images import load_grayscale
+from .images import file_sha256, load_grayscale
 from .metrics import (
     EPSILON,
     average_gradient,
@@ -27,6 +28,7 @@ from .metrics import (
 )
 from .models import ImageRecord, ROI
 from .project_store import ProjectStore
+from .roi_templates import roi_configuration_payload, template_version_for
 from .validation import validate_project
 
 
@@ -114,7 +116,7 @@ def _evaluate_image(
 
     rows_by_roi = {row["roi_id"]: row for row in roi_rows}
     for roi in rois:
-        if roi.type not in {"weak_bone", "strong_bone"}:
+        if roi.type != "weak_bone":
             continue
         row = rows_by_roi[roi.id]
         pair = roi_by_id.get(roi.paired_surrounding_roi_id or "")
@@ -242,16 +244,21 @@ def evaluate_project(store: ProjectStore) -> dict[str, Any]:
         roi_rows.extend(details)
 
     baseline = next(row for row in summaries if row["role"] == "original")
-    primary_key = "weak_bone_mean_cnr_background" if config.primary_cnr == "background" else "weak_bone_mean_cnr_local"
     for row in summaries:
         if row.get("status") == "failed":
             continue
-        row["primary_cnr"] = row.get(primary_key)
+        row["local_cnr_change_percent"] = None
+        row["background_cnr_change_percent"] = None
+        row["weak_ag_change_percent"] = None
+        row["primary_cnr"] = row.get("weak_bone_mean_cnr_local")
         if row["role"] != "original":
-            row["primary_cnr_change_percent"] = relative_change(row.get("primary_cnr"), baseline.get(primary_key))
-            row["weak_bone_mean_average_gradient_change_percent"] = relative_change(
+            row["local_cnr_change_percent"] = relative_change(row.get("weak_bone_mean_cnr_local"), baseline.get("weak_bone_mean_cnr_local"))
+            row["background_cnr_change_percent"] = relative_change(row.get("weak_bone_mean_cnr_background"), baseline.get("weak_bone_mean_cnr_background"))
+            row["primary_cnr_change_percent"] = row["local_cnr_change_percent"]
+            row["weak_ag_change_percent"] = relative_change(
                 row.get("weak_bone_mean_average_gradient"), baseline.get("weak_bone_mean_average_gradient")
             )
+            row["weak_bone_mean_average_gradient_change_percent"] = row["weak_ag_change_percent"]
             row["background_noise_change_percent"] = relative_change(
                 row.get("background_noise_pooled"), baseline.get("background_noise_pooled")
             )
@@ -264,8 +271,8 @@ def evaluate_project(store: ProjectStore) -> dict[str, Any]:
         if row.get("status") == "failed":
             continue
         row["status"], row["message"] = _metric_status(row, validation_warnings)
-        if config.primary_cnr == "background" and row.get("primary_cnr") is None and row.get("weak_bone_mean_cnr_local") is not None:
-            row["message"] = (row.get("message", "") + "；当前 Background CNR 不可用，可切换到 Local CNR。").strip("；")
+        if row.get("weak_bone_mean_cnr_background") is None and row.get("weak_bone_mean_cnr_local") is not None:
+            row["message"] = (row.get("message", "") + "；Background CNR 不可用。").strip("；")
 
     evaluation_id = f"eval-{uuid4().hex}"
     result = {
@@ -276,7 +283,17 @@ def evaluate_project(store: ProjectStore) -> dict[str, Any]:
         "project_id": project.id,
         "evaluation_timestamp": datetime.now(timezone.utc).isoformat(),
         "config": asdict(config),
-        "input_hashes": {record.id: record.sha256 for record in records},
+        "input_hashes": {record.id: file_sha256(store.resolve(record.relative_path)) for record in records},
+        "roi_template_version": template_version_for(
+            project.rois,
+            project.original.width if project.original else None,
+            project.original.height if project.original else None,
+        ),
+        "roi_snapshot": roi_configuration_payload(project.rois),
+        "roi_config_hash": hashlib.sha256(
+            json.dumps(roi_configuration_payload(project.rois), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "metric_algorithm_version": METRIC_SPEC_VERSION,
         "runtime": {
             "python": platform.python_version(),
             "numpy": np.__version__,

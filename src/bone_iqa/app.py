@@ -5,6 +5,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import numpy as np
 from PIL import Image, ImageTk
 
 from .evaluator import evaluate_project, export_csv_bundle
@@ -12,7 +13,8 @@ from .images import load_grayscale
 from .metrics import EPSILON, roi_statistics
 from .models import ROI
 from .project_store import ProjectError, ProjectStore, nearest_surrounding_roi_id
-from .roi_recommender import ROIRecommendation, recommend_rois, remove_recommendation
+from .roi_recommender import ROIRecommendation, remove_recommendation
+from .roi_templates import ROI_TEMPLATE_SIZE, ROI_TEMPLATE_VERSION, build_roi_template
 from .validation import validate_project
 
 
@@ -41,6 +43,305 @@ def format_number(value, digits: int = 4) -> str:
         return str(value)
 
 
+METRIC_TOOLTIPS = {
+    "Local CNR": "衡量弱骨骼与其附近区域是否容易区分。通常越高表示局部辨识度越好，但它不直接代表图像是否锐利。",
+    "Background CNR": "衡量弱骨骼相对于体外背景是否突出。通常越高越好。背景被抬亮或背景噪声增大时，该指标可能下降。",
+    "Weak AG": "平均梯度，用于反映弱骨骼区域的边缘和细节变化。通常越高表示边缘更明显，但噪声也可能使 AG 虚高，因此必须结合 Noise 一起判断。",
+    "Noise": "表示背景区域灰度波动程度。通常越低表示背景越干净。但图像被过度平滑或整体压暗时 Noise 也可能下降，因此不能单独判断图像质量。",
+    "SSIM": "衡量处理结果与原图结构的相似程度，越接近 1 越相似。高 SSIM 只说明结构变化较小，不代表增强效果一定更好。",
+    "Strong Sat.%": "强骨骼 ROI 中接近灰度饱和的像素比例。过高可能意味着强骨骼发白、内部灰度细节丢失。",
+    "Δ%": "相对于原图的百分比变化。正负只表示变化方向，是否改善需要结合具体指标含义判断。",
+    "Sat. Δpp": "强骨骼饱和率相对于原图变化的百分点，不是普通百分比变化。",
+}
+
+
+class HeaderTooltip:
+    """Small delayed tooltip for metric table headings."""
+
+    def __init__(self, widget: ttk.Treeview, descriptions: dict[str, str]):
+        self.widget = widget
+        self.descriptions = descriptions
+        self.tip: tk.Toplevel | None = None
+        self.after_id: str | None = None
+        widget.bind("<Motion>", self._motion, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+
+    def _motion(self, event):
+        self.hide()
+        if self.widget.identify_region(event.x, event.y) != "heading":
+            return
+        column = self.widget.identify_column(event.x)
+        heading = self.widget.heading(column, "text")
+        text = next((value for key, value in self.descriptions.items() if key in heading), None)
+        if text:
+            self.after_id = self.widget.after(450, lambda: self.show(text, event.x_root + 12, event.y_root + 12))
+
+    def show(self, text: str, x: int, y: int):
+        self.after_id = None
+        if self.tip is not None:
+            return
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tip.geometry(f"+{x}+{y}")
+        ttk.Label(tip, text=text, justify="left", wraplength=380, padding=8, relief="solid", borderwidth=1).pack()
+        self.tip = tip
+
+    def hide(self, _event=None):
+        if self.after_id is not None:
+            self.widget.after_cancel(self.after_id)
+            self.after_id = None
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+
+class ImagePreviewWindow(tk.Toplevel):
+    def __init__(self, parent, image: Image.Image, title: str):
+        super().__init__(parent)
+        self.title(f"图像预览：{title}")
+        self.geometry("900x700")
+        self.image = image.convert("L")
+        self.zoom = 1.0
+        self.center = (0.5, 0.5)
+        self.photo = None
+        self.canvas = tk.Canvas(self, background="#111", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, padx=6, pady=6)
+        toolbar = ttk.Frame(self)
+        toolbar.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(toolbar, text="放大", command=lambda: self._change_zoom(1.25)).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="缩小", command=lambda: self._change_zoom(0.8)).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="恢复原始视图", command=self.reset_view).pack(side="left", padx=2)
+        self.canvas.bind("<Configure>", lambda _event: self.render())
+        self.canvas.bind("<MouseWheel>", self._wheel)
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.drag_start = None
+        self.after(30, self.render)
+
+    def reset_view(self):
+        self.zoom = 1.0
+        self.center = (0.5, 0.5)
+        self.render()
+
+    def _change_zoom(self, factor: float):
+        self.zoom = min(8.0, max(0.25, self.zoom * factor))
+        self.render()
+
+    def _wheel(self, event):
+        self._change_zoom(1.2 if event.delta > 0 else 0.833333)
+
+    def _press(self, event):
+        self.drag_start = (event.x, event.y, self.center)
+
+    def _drag(self, event):
+        if not self.drag_start:
+            return
+        x0, y0, (cx, cy) = self.drag_start
+        width = max(self.canvas.winfo_width(), 1)
+        height = max(self.canvas.winfo_height(), 1)
+        self.center = (min(1.0, max(0.0, cx - (event.x - x0) / width / self.zoom)), min(1.0, max(0.0, cy - (event.y - y0) / height / self.zoom)))
+        self.render()
+
+    def render(self):
+        width = max(self.canvas.winfo_width(), 100)
+        height = max(self.canvas.winfo_height(), 100)
+        aspect = width / height
+        source_aspect = self.image.width / max(self.image.height, 1)
+        crop_w = self.image.width / self.zoom
+        crop_h = self.image.height / self.zoom
+        if crop_w / crop_h > aspect:
+            crop_w = crop_h * aspect
+        else:
+            crop_h = crop_w / aspect
+        cx, cy = self.center[0] * self.image.width, self.center[1] * self.image.height
+        left = min(max(0, cx - crop_w / 2), self.image.width - crop_w)
+        top = min(max(0, cy - crop_h / 2), self.image.height - crop_h)
+        crop = self.image.crop((int(left), int(top), int(left + crop_w), int(top + crop_h))).resize((width, height), Image.Resampling.LANCZOS)
+        self.photo = ImageTk.PhotoImage(crop)
+        self.canvas.delete("all")
+        self.canvas.create_image(width / 2, height / 2, image=self.photo)
+
+
+class ComparisonWindow(tk.Toplevel):
+    def __init__(self, parent, store: ProjectStore, result: dict, scheme_ids: list[str]):
+        super().__init__(parent)
+        self.title("方案比较")
+        self.geometry("1250x800")
+        self.store = store
+        self.result = result
+        self.scheme_ids = scheme_ids
+        self.images: list[Image.Image] = []
+        self.names: list[str] = []
+        self.zoom = 1.0
+        self.center = (0.5, 0.5)
+        self.photos: list[ImageTk.PhotoImage | None] = []
+        self.canvases: list[tk.Canvas] = []
+        records = ([store.project.original] if store.project.original else []) + store.project.algorithms
+        by_id = {record.id: record for record in records}
+        for scheme_id in scheme_ids:
+            record = by_id[scheme_id]
+            self.names.append(record.display_name)
+            try:
+                self.images.append(Image.open(store.resolve(record.relative_path)).convert("L"))
+            except Exception:
+                self.images.append(Image.new("L", (500, 800), 0))
+        toolbar = ttk.Frame(self)
+        toolbar.pack(fill="x", padx=8, pady=6)
+        ttk.Button(toolbar, text="恢复全部视图", command=self.reset_view).pack(side="left", padx=2)
+        roi_names = [roi.name for roi in store.project.rois if roi.type in {"weak_bone", "strong_bone"}]
+        self.roi_var = tk.StringVar()
+        self.roi_combo = ttk.Combobox(toolbar, textvariable=self.roi_var, values=roi_names, state="readonly", width=16)
+        self.roi_combo.pack(side="left", padx=8)
+        ttk.Button(toolbar, text="定位 ROI", command=self.focus_roi).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="查看两方案差异图", command=self.show_difference).pack(side="left", padx=2)
+        self.image_frame = ttk.Frame(self)
+        self.image_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        self.image_frame.rowconfigure(0, weight=1)
+        for index, name in enumerate(self.names):
+            self.image_frame.columnconfigure(index, weight=1)
+            frame = ttk.Frame(self.image_frame)
+            frame.grid(row=0, column=index, sticky="nsew", padx=3)
+            frame.rowconfigure(0, weight=1)
+            frame.columnconfigure(0, weight=1)
+            canvas = tk.Canvas(frame, background="#111", highlightthickness=0)
+            canvas.grid(row=0, column=0, sticky="nsew")
+            ttk.Label(frame, text=name, anchor="center").grid(row=1, column=0, sticky="ew", pady=(3, 0))
+            canvas.bind("<Configure>", lambda _event: self.render())
+            canvas.bind("<MouseWheel>", self._wheel)
+            canvas.bind("<ButtonPress-1>", self._press)
+            canvas.bind("<B1-Motion>", self._drag)
+            self.canvases.append(canvas)
+        self.drag_start = None
+        self.data_frame = ttk.Frame(self)
+        self.data_tree = self._build_data_tree()
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack_forget()
+        # Put both views in a notebook after the canvases have been created.
+        self._rebuild_as_notebook(toolbar)
+        self.after(50, self.render)
+
+    def _rebuild_as_notebook(self, toolbar):
+        self.image_frame.pack_forget()
+        self.data_frame.pack_forget()
+        self.notebook.pack(fill="both", expand=True, padx=8, pady=4)
+        image_tab = ttk.Frame(self.notebook)
+        image_tab.rowconfigure(0, weight=1)
+        image_tab.columnconfigure(0, weight=1)
+        self.image_frame.pack_forget()
+        self.image_frame = ttk.Frame(image_tab)
+        self.image_frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self.image_frame.rowconfigure(0, weight=1)
+        for index, name in enumerate(self.names):
+            self.image_frame.columnconfigure(index, weight=1)
+            frame = ttk.Frame(self.image_frame)
+            frame.grid(row=0, column=index, sticky="nsew", padx=3)
+            frame.rowconfigure(0, weight=1)
+            frame.columnconfigure(0, weight=1)
+            canvas = tk.Canvas(frame, background="#111", highlightthickness=0)
+            canvas.grid(row=0, column=0, sticky="nsew")
+            ttk.Label(frame, text=name, anchor="center").grid(row=1, column=0, sticky="ew", pady=(3, 0))
+            canvas.bind("<Configure>", lambda _event: self.render())
+            canvas.bind("<MouseWheel>", self._wheel)
+            canvas.bind("<ButtonPress-1>", self._press)
+            canvas.bind("<B1-Motion>", self._drag)
+            self.canvases[index] = canvas
+        self.notebook.add(image_tab, text="图像比较")
+        self.notebook.add(self.data_frame, text="数据比较")
+        self.data_frame.pack_forget()
+
+    def _build_data_tree(self):
+        tree = ttk.Treeview(self.data_frame, columns=[str(i) for i in range(len(self.names))], show="tree headings")
+        tree.heading("#0", text="指标")
+        tree.column("#0", width=190, anchor="w")
+        for index, name in enumerate(self.names):
+            key = str(index)
+            tree.heading(key, text=name)
+            tree.column(key, width=145, anchor="center")
+        rows = (
+            ("Local CNR", "weak_bone_mean_cnr_local"), ("Local Δ%", "local_cnr_change_percent"),
+            ("Background CNR", "weak_bone_mean_cnr_background"), ("Background Δ%", "background_cnr_change_percent"),
+            ("Weak AG", "weak_bone_mean_average_gradient"), ("AG Δ%", "weak_ag_change_percent"),
+            ("Noise", "background_noise_pooled"), ("Noise Δ%", "background_noise_change_percent"),
+            ("SSIM", "ssim"), ("Strong Sat.%", "strong_bone_saturation_mean"), ("Sat. Δpp", "saturation_change_pp"),
+        )
+        by_id = {row.get("scheme_id"): row for row in self.result.get("metrics", [])}
+        for label, key in rows:
+            values = []
+            for scheme_id in self.scheme_ids:
+                value = by_id.get(scheme_id, {}).get(key)
+                if key == "strong_bone_saturation_mean" and value is not None:
+                    value *= 100
+                values.append(format_number(value, 2 if "Δ" in label or "Sat" in label else 4))
+            tree.insert("", "end", text=label, values=values)
+        tree.pack(fill="both", expand=True, padx=6, pady=6)
+        HeaderTooltip(tree, METRIC_TOOLTIPS)
+        return tree
+
+    def reset_view(self):
+        self.zoom, self.center = 1.0, (0.5, 0.5)
+        self.render()
+
+    def _wheel(self, event):
+        self.zoom = min(8.0, max(0.25, self.zoom * (1.2 if event.delta > 0 else 0.833333)))
+        self.render()
+
+    def _press(self, event):
+        self.drag_start = (event.x, event.y, self.center)
+
+    def _drag(self, event):
+        if not self.drag_start:
+            return
+        x0, y0, (cx, cy) = self.drag_start
+        canvas = self.canvases[0]
+        self.center = (min(1.0, max(0.0, cx - (event.x - x0) / max(canvas.winfo_width(), 1) / self.zoom)), min(1.0, max(0.0, cy - (event.y - y0) / max(canvas.winfo_height(), 1) / self.zoom)))
+        self.render()
+
+    def focus_roi(self):
+        name = self.roi_var.get()
+        roi = next((roi for roi in self.store.project.rois if roi.name == name), None)
+        if roi is None:
+            return
+        width, height = self.images[0].size
+        self.center = ((roi.x + roi.width / 2) / width, (roi.y + roi.height / 2) / height)
+        self.zoom = 3.0
+        self.render()
+
+    def render(self):
+        if not self.canvases or not self.images:
+            return
+        for canvas, image in zip(self.canvases, self.images):
+            width = max(canvas.winfo_width(), 100)
+            height = max(canvas.winfo_height(), 100)
+            aspect = width / height
+            crop_w = image.width / self.zoom
+            crop_h = image.height / self.zoom
+            if crop_w / crop_h > aspect:
+                crop_w = crop_h * aspect
+            else:
+                crop_h = crop_w / aspect
+            cx, cy = self.center[0] * image.width, self.center[1] * image.height
+            left = min(max(0, cx - crop_w / 2), image.width - crop_w)
+            top = min(max(0, cy - crop_h / 2), image.height - crop_h)
+            crop = image.crop((int(left), int(top), int(left + crop_w), int(top + crop_h))).resize((width, height), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(crop)
+            canvas.delete("all")
+            canvas.create_image(width / 2, height / 2, image=photo)
+            canvas._comparison_photo = photo
+
+    def show_difference(self):
+        if len(self.images) != 2:
+            messagebox.showinfo("差异图", "差异图需要恰好选择两个方案。", parent=self)
+            return
+        first = np.asarray(self.images[0], dtype=np.float32)
+        second = np.asarray(self.images[1], dtype=np.float32)
+        difference = np.abs(first - second)
+        peak = float(difference.max())
+        if peak > 0:
+            difference = difference / peak * 255.0
+        ImagePreviewWindow(self, Image.fromarray(difference.astype("uint8")), f"{self.names[0]} - {self.names[1]}（差异图）")
+
+
 class BoneIQAApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -56,6 +357,9 @@ class BoneIQAApp(tk.Tk):
         self._selected_roi_id: str | None = None
         self._selected_recommendation_id: str | None = None
         self.roi_recommendations: list[ROIRecommendation] = []
+        self._summary_thumbnail_refs: dict[str, ImageTk.PhotoImage] = {}
+        self._comparison_selected_ids: set[str] = set()
+        self._last_evaluation: dict | None = None
         self._build_menu()
         self._build_ui()
         self._set_status("请新建或打开评价项目")
@@ -198,14 +502,8 @@ class BoneIQAApp(tk.Tk):
         toolbar = ttk.Frame(self.evaluate_tab, padding=8)
         toolbar.pack(fill="x")
         ttk.Button(toolbar, text="开始评价", command=self.run_evaluation).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="比较所选方案", command=self.compare_selected_schemes).pack(side="left", padx=3)
         ttk.Button(toolbar, text="导出 CSV", command=self.export_results).pack(side="left", padx=3)
-        ttk.Label(toolbar, text="主 CNR 类型").pack(side="left", padx=(14, 3))
-        self.primary_cnr_var = tk.StringVar(value="local")
-        primary_combo = ttk.Combobox(toolbar, textvariable=self.primary_cnr_var, values=("local", "background"), state="readonly", width=12)
-        primary_combo.pack(side="left")
-        primary_combo.bind("<<ComboboxSelected>>", self._primary_cnr_changed)
-        self.primary_label = tk.StringVar(value="主 CNR：Local / Weak Bone Mean")
-        ttk.Label(toolbar, textvariable=self.primary_label).pack(side="right", padx=8)
 
         result_book = ttk.Notebook(self.evaluate_tab)
         result_book.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -218,17 +516,28 @@ class BoneIQAApp(tk.Tk):
         result_book.add(roi_frame, text="ROI 表")
         result_book.add(validation_frame, text="检查结果")
 
-        summary_columns = ("name", "cnr", "cnr_change", "ag", "ag_change", "noise", "noise_change", "ssim", "sat", "sat_change", "status", "message")
-        self.summary_tree = ttk.Treeview(summary_frame, columns=summary_columns, show="headings")
+        summary_frame.rowconfigure(0, weight=1)
+        summary_frame.columnconfigure(0, weight=1)
+        summary_columns = ("compare", "name", "local", "local_change", "background", "background_change", "ag", "ag_change", "noise", "noise_change", "ssim", "sat", "sat_change", "status")
+        self.summary_tree = ttk.Treeview(summary_frame, columns=summary_columns, show="tree headings", selectmode="browse")
+        self.summary_tree.heading("#0", text="结果图")
+        self.summary_tree.column("#0", width=90, anchor="center", stretch=False)
         summary_headers = {
-            "name": "方案", "cnr": "Weak CNR", "cnr_change": "CNR Δ%", "ag": "Weak AG",
-            "ag_change": "AG Δ%", "noise": "Noise", "noise_change": "Noise Δ%",
-            "ssim": "SSIM", "sat": "Strong Sat.%", "sat_change": "Sat. Δpp", "status": "状态", "message": "说明",
+            "compare": "比较", "name": "方案", "local": "Local CNR", "local_change": "Local Δ%",
+            "background": "Background CNR", "background_change": "Background Δ%", "ag": "Weak AG",
+            "ag_change": "AG Δ%", "noise": "Noise", "noise_change": "Noise Δ%", "ssim": "SSIM",
+            "sat": "Strong Sat.%", "sat_change": "Sat. Δpp", "status": "状态",
         }
         for key in summary_columns:
             self.summary_tree.heading(key, text=summary_headers[key])
-            self.summary_tree.column(key, width=340 if key == "message" else 115 if key == "name" else 88, anchor="w" if key == "message" else "center")
-        self.summary_tree.pack(fill="both", expand=True)
+            self.summary_tree.column(key, width=120 if key == "name" else 105 if key == "compare" else 100, anchor="w" if key == "name" else "center")
+        self.summary_tree.grid(row=0, column=0, sticky="nsew")
+        self.summary_tree.bind("<Button-1>", self._summary_tree_click)
+        HeaderTooltip(self.summary_tree, METRIC_TOOLTIPS)
+        diagnostic_frame = ttk.LabelFrame(summary_frame, text="指标解释 / 诊断", padding=6)
+        diagnostic_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.diagnostic_var = tk.StringVar(value="评价完成后，这里显示基于指标组合的客观描述；不会生成综合评分或推荐排名。")
+        ttk.Label(diagnostic_frame, textvariable=self.diagnostic_var, justify="left", wraplength=1150).pack(fill="x")
 
         auxiliary_columns = ("name", "all_bg", "all_local", "strong_bg", "strong_local", "global_ag", "strong_ag")
         self.auxiliary_tree = ttk.Treeview(auxiliary_frame, columns=auxiliary_columns, show="headings")
@@ -482,31 +791,27 @@ class BoneIQAApp(tk.Tk):
     def auto_recommend_rois(self):
         store = self._require_store()
         if not store or store.project.original is None:
-            messagebox.showwarning("缺少原图", "ROI 自动推荐只分析原图，请先导入原图。")
+            messagebox.showwarning("缺少原图", "请先导入原图。")
             return
-        if store.project.rois and not messagebox.askyesno("保留已有 ROI", "已有正式 ROI 不会被覆盖。是否保留已有 ROI 并新增推荐候选？"):
+        if (store.project.original.width, store.project.original.height) != ROI_TEMPLATE_SIZE:
+            messagebox.showwarning(
+                "ROI 模板尺寸不一致",
+                "当前图像尺寸与 ROI Template v1 不一致，无法加载固定 ROI 模板。",
+            )
+            return
+        if store.project.rois and not messagebox.askyesno(
+            "加载固定 ROI 模板",
+            "当前已有正式 ROI。加载 ROI Template v1 将替换当前正式 ROI，是否继续？",
+        ):
             return
         try:
-            image = load_grayscale(store.resolve(store.project.original.relative_path))
-            self.roi_recommendations = recommend_rois(image)
-            self._selected_recommendation_id = None
-            self.refresh_roi_list()
-            self.refresh_roi_canvas()
-            if not self.roi_recommendations:
-                messagebox.showwarning("未找到候选", "未找到满足非恒定背景和结构评分要求的候选 ROI，请继续手工标注。")
-            else:
-                counts = {key: sum(1 for item in self.roi_recommendations if item.roi.type == key) for key in ROI_LABELS}
-                unpaired = sum(1 for item in self.roi_recommendations if item.roi.type in {"weak_bone", "strong_bone"} and not item.roi.paired_surrounding_roi_id)
-                message = (
-                    f"已生成：背景 {counts['background']}，强骨骼 {counts['strong_bone']}，"
-                    f"弱骨骼 {counts['weak_bone']}，邻域 {counts['surrounding']}。"
-                    "所有 Bone 候选均已自动尝试配对。"
-                )
-                if unpaired:
-                    message += f"有 {unpaired} 个骨骼候选未找到可靠邻域，请人工检查。"
-                self._set_status(message)
+            store.replace_rois(build_roi_template())
+            self.roi_recommendations = []
+            self.clear_roi_form()
+            self.refresh_all()
+            self._set_status(f"已加载 {ROI_TEMPLATE_VERSION}，共保存 12 个固定 ROI。")
         except Exception as exc:
-            messagebox.showerror("ROI 推荐失败", str(exc))
+            messagebox.showerror("加载 ROI 模板失败", str(exc))
 
     def _update_recommendation_from_form(self, recommendation: ROIRecommendation) -> None:
         roi = recommendation.roi
@@ -669,19 +974,6 @@ class BoneIQAApp(tk.Tk):
         finally:
             self.config(cursor="")
 
-    def _primary_cnr_changed(self, _event=None):
-        if not self.store:
-            return
-        selected = self.primary_cnr_var.get()
-        if selected not in {"local", "background"}:
-            return
-        self.store.project.evaluation_config.primary_cnr = selected
-        self.store.project.latest_evaluation_id = None
-        self.store.save()
-        self.refresh_overview()
-        self.primary_label.set(f"主 CNR：{selected.title()} / Weak Bone Mean（需重新评价）")
-        self._set_status("主 CNR 类型已更新；请重新开始评价。两类 CNR 都会继续计算和保存。")
-
     def export_results(self):
         store = self._require_store()
         if not store:
@@ -701,10 +993,15 @@ class BoneIQAApp(tk.Tk):
         self.refresh_roi_list()
         self.refresh_roi_canvas()
         if self.store:
-            self.primary_cnr_var.set(self.store.project.evaluation_config.primary_cnr)
             result = self.store.load_latest_evaluation()
             if result:
                 self._fill_results(result)
+            else:
+                self._show_expired_evaluation(
+                    "检测到图像文件或 ROI 配置已发生变化，请重新评价。"
+                    if self.store.evaluation_status() == "expired"
+                    else "当前没有可用的评价结果，请点击“开始评价”。"
+                )
 
     def refresh_overview(self):
         if not self.store:
@@ -712,12 +1009,19 @@ class BoneIQAApp(tk.Tk):
             return
         project = self.store.project
         counts = {key: sum(1 for roi in project.rois if roi.type == key) for key in ROI_LABELS}
+        evaluation_state = self.store.evaluation_status()
+        evaluation_label = {
+            "current": "已有当前评价结果",
+            "legacy": "已有旧格式评价结果（建议重新评价）",
+            "expired": "结果已过期",
+            "none": "尚未评价或结果已失效",
+        }.get(evaluation_state, "尚未评价或结果已失效")
         self.overview_text.set(
             f"项目：{project.name}\n"
             f"原图：{project.original.display_name if project.original else '未导入'}\n"
             f"增强方案：{len(project.algorithms)} 个\n"
             f"ROI：弱骨骼 {counts['weak_bone']} / 强骨骼 {counts['strong_bone']} / 邻域 {counts['surrounding']} / 背景 {counts['background']}\n"
-            f"评价状态：{'已有结果 ' + project.latest_evaluation_id if project.latest_evaluation_id else '尚未评价或结果已失效'}"
+            f"评价状态：{evaluation_label}"
         )
 
     def refresh_images(self):
@@ -831,22 +1135,145 @@ class BoneIQAApp(tk.Tk):
         canvas.create_rectangle(x1, y1, x2, y2, **options)
         canvas.create_text(x1 + 3, y1 + 3, text=label, fill=color, anchor="nw", font=("Microsoft YaHei UI", 10, "bold" if highlighted else "normal"))
 
+    def _record_for_id(self, scheme_id: str):
+        if not self.store:
+            return None
+        records = ([self.store.project.original] if self.store.project.original else []) + self.store.project.algorithms
+        return next((record for record in records if record.id == scheme_id), None)
+
+    def _thumbnail_for_record(self, record):
+        if record is None:
+            thumbnail = ImageTk.PhotoImage(Image.new("L", (70, 110), 80))
+            self._summary_thumbnail_refs["missing"] = thumbnail
+            return thumbnail
+        try:
+            image = Image.open(self.store.resolve(record.relative_path)).convert("L")
+            image.thumbnail((70, 110), Image.Resampling.LANCZOS)
+            canvas = Image.new("L", (70, 110), 32)
+            canvas.paste(image, ((70 - image.width) // 2, (110 - image.height) // 2))
+        except Exception:
+            canvas = Image.new("L", (70, 110), 90)
+        thumbnail = ImageTk.PhotoImage(canvas)
+        self._summary_thumbnail_refs[record.id if record else "missing"] = thumbnail
+        return thumbnail
+
+    def _summary_tree_click(self, event):
+        row_id = self.summary_tree.identify_row(event.y)
+        column = self.summary_tree.identify_column(event.x)
+        if not row_id:
+            return
+        if column == "#0":
+            self._summary_tree_double_click(event)
+            return "break"
+        if column != "#1":
+            return
+        if row_id in self._comparison_selected_ids:
+            self._comparison_selected_ids.remove(row_id)
+        else:
+            self._comparison_selected_ids.add(row_id)
+        values = list(self.summary_tree.item(row_id, "values"))
+        if values:
+            values[0] = "☑" if row_id in self._comparison_selected_ids else "☐"
+            self.summary_tree.item(row_id, values=values)
+        return "break"
+
+    def _summary_tree_double_click(self, event):
+        row_id = self.summary_tree.identify_row(event.y)
+        if not row_id:
+            return
+        record = self._record_for_id(row_id)
+        if record is None or self.store is None:
+            return
+        try:
+            image = Image.open(self.store.resolve(record.relative_path)).convert("L")
+        except Exception:
+            messagebox.showwarning("图像缺失", f"无法打开结果图：{record.display_name}", parent=self)
+            return
+        ImagePreviewWindow(self, image, record.display_name)
+
+    def compare_selected_schemes(self):
+        if not self.store:
+            return
+        result = self._last_evaluation or self.store.load_latest_evaluation()
+        selected = [row.get("scheme_id") for row in (result or {}).get("metrics", []) if row.get("scheme_id") in self._comparison_selected_ids]
+        if len(selected) < 2:
+            messagebox.showinfo("方案比较", "请至少选择两个方案。", parent=self)
+            return
+        if len(selected) > 4:
+            messagebox.showinfo("方案比较", "最多同时比较 4 个方案。", parent=self)
+            return
+        if not result:
+            messagebox.showwarning("尚无评价结果", "请先完成一次评价。", parent=self)
+            return
+        ComparisonWindow(self, self.store, result, selected)
+
+    def _show_expired_evaluation(self, message: str):
+        self._last_evaluation = None
+        self._comparison_selected_ids.clear()
+        self.summary_tree.delete(*self.summary_tree.get_children())
+        self.auxiliary_tree.delete(*self.auxiliary_tree.get_children())
+        self.roi_result_tree.delete(*self.roi_result_tree.get_children())
+        self.diagnostic_var.set(message)
+        self._fill_validation([{"severity": "warning", "object_id": self.store.project.id if self.store else "", "message": message}])
+
+    @staticmethod
+    def _status_label(row: dict) -> str:
+        status = row.get("status", "")
+        if status == "valid":
+            return "计算正常"
+        if status == "valid_with_warnings":
+            return "计算正常（有警告）"
+        if status == "partial":
+            return "指标缺失"
+        if status == "failed":
+            return "计算失败"
+        return status or "未知状态"
+
+    def _diagnostic_text(self, result: dict) -> str:
+        rows = [row for row in result.get("metrics", []) if row.get("role") != "original" and row.get("status") != "failed"]
+        lines = []
+        for row in rows:
+            ag_change = row.get("weak_ag_change_percent")
+            noise_change = row.get("background_noise_change_percent")
+            local_change = row.get("local_cnr_change_percent")
+            sat_change = row.get("saturation_change_pp")
+            notes = []
+            if ag_change is not None and noise_change is not None and ag_change > 10 and noise_change > 10:
+                notes.append("边缘和细节增强明显，但部分 AG 提升可能伴随背景噪声放大，建议结合图像观察")
+            if row.get("ssim") is not None and row["ssim"] > 0.95 and ag_change is not None and ag_change < -10:
+                notes.append("处理结果与原图结构接近，但弱骨骼局部梯度下降，可能存在平滑导致的细节损失")
+            if local_change is not None and local_change > 10 and sat_change is not None and sat_change > 5:
+                notes.append("弱骨骼辨识度提高，但强骨骼区域的饱和风险增加")
+            if noise_change is not None and ag_change is not None and noise_change < -10 and ag_change < -10:
+                notes.append("背景波动降低，但同时可能存在过度平滑，需要检查骨骼细节是否损失")
+            if notes:
+                lines.append(f"{row.get('scheme_name', '方案')}：" + "；".join(notes) + "。")
+        return "\n".join(lines) if lines else "当前指标组合未触发预设提示。请结合图像、ROI 明细和数值变化进行客观判断，不使用综合评分。"
+
     def _fill_results(self, result):
+        self._last_evaluation = result
         self.summary_tree.delete(*self.summary_tree.get_children())
         self.auxiliary_tree.delete(*self.auxiliary_tree.get_children())
         self.roi_result_tree.delete(*self.roi_result_tree.get_children())
         self._fill_validation(result.get("validation", []))
-        primary = result.get("config", {}).get("primary_cnr", "local")
-        self.primary_cnr_var.set(primary)
-        self.primary_label.set(f"主 CNR：{primary.title()} / Weak Bone Mean")
+        self._summary_thumbnail_refs.clear()
+        valid_ids = {row.get("scheme_id") for row in result.get("metrics", [])}
+        self._comparison_selected_ids.intersection_update(valid_ids)
         for row in result.get("metrics", []):
-            self.summary_tree.insert("", "end", values=(
-                row.get("scheme_name", ""), format_number(row.get("primary_cnr")),
-                format_number(row.get("primary_cnr_change_percent"), 2), format_number(row.get("weak_bone_mean_average_gradient")),
-                format_number(row.get("weak_bone_mean_average_gradient_change_percent"), 2), format_number(row.get("background_noise_pooled")),
+            record = self._record_for_id(row.get("scheme_id", ""))
+            thumbnail = self._thumbnail_for_record(record)
+            status = self._status_label(row)
+            if row.get("message") and status not in {"计算正常", "计算正常（有警告）"}:
+                status += "：" + str(row["message"])
+            self.summary_tree.insert("", "end", iid=row.get("scheme_id"), image=thumbnail, values=(
+                "☑" if row.get("scheme_id") in self._comparison_selected_ids else "☐",
+                row.get("scheme_name", ""), format_number(row.get("weak_bone_mean_cnr_local")),
+                format_number(row.get("local_cnr_change_percent"), 2), format_number(row.get("weak_bone_mean_cnr_background")),
+                format_number(row.get("background_cnr_change_percent"), 2), format_number(row.get("weak_bone_mean_average_gradient")),
+                format_number(row.get("weak_ag_change_percent"), 2), format_number(row.get("background_noise_pooled")),
                 format_number(row.get("background_noise_change_percent"), 2), format_number(row.get("ssim")),
                 format_number(None if row.get("strong_bone_saturation_mean") is None else row["strong_bone_saturation_mean"] * 100, 2),
-                format_number(row.get("saturation_change_pp"), 2), row.get("status", ""), row.get("message", ""),
+                format_number(row.get("saturation_change_pp"), 2), status,
             ))
             self.auxiliary_tree.insert("", "end", values=(
                 row.get("scheme_name", ""),
@@ -865,6 +1292,7 @@ class BoneIQAApp(tk.Tk):
                 format_number(None if row.get("saturation_ratio") is None else row["saturation_ratio"] * 100, 2), row.get("status", ""),
                 row.get("message") or row.get("cnr_background_reason") or row.get("cnr_local_reason") or row.get("saturation_reason", ""),
             ))
+        self.diagnostic_var.set(self._diagnostic_text(result))
 
     def _fill_validation(self, rows):
         self.validation_tree.delete(*self.validation_tree.get_children())

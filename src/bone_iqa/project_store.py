@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .images import dtype_range, image_metadata
+from .images import dtype_range, file_sha256, image_metadata
 from .models import ImageRecord, Project, ROI, utc_now
+from .roi_templates import roi_configuration_payload
 
 
 PROJECT_FILE = "project.json"
@@ -193,6 +194,12 @@ class ProjectStore:
         self.project.latest_evaluation_id = None
         self.save()
 
+    def replace_rois(self, rois: list[ROI]) -> None:
+        """Replace all saved ROIs in one atomic project update."""
+        self.project.rois = list(rois)
+        self.project.latest_evaluation_id = None
+        self.save()
+
     def clear_rois(self) -> None:
         """Remove every saved ROI and invalidate the latest evaluation."""
         self.project.rois.clear()
@@ -216,7 +223,44 @@ class ProjectStore:
             evaluation = json.load(stream)
         if evaluation.get("evaluation_id") != self.project.latest_evaluation_id:
             return None
+        if self.evaluation_status(evaluation) == "expired":
+            return None
         return evaluation
+
+    def evaluation_status(self, evaluation: dict[str, Any] | None = None) -> str:
+        """Return none/current/expired/legacy for the latest cached evaluation."""
+        if evaluation is None:
+            if not self.project.latest_evaluation_id:
+                return "none"
+            path = self.root / "evaluations/latest.json"
+            if not path.exists():
+                return "expired"
+            try:
+                with path.open("r", encoding="utf-8") as stream:
+                    evaluation = json.load(stream)
+            except (OSError, ValueError):
+                return "expired"
+        if evaluation.get("evaluation_id") != self.project.latest_evaluation_id:
+            return "expired"
+        hashes = evaluation.get("input_hashes")
+        roi_hash = evaluation.get("roi_config_hash")
+        if not hashes:
+            return "legacy"
+        records = ([self.project.original] if self.project.original else []) + self.project.algorithms
+        for record in records:
+            try:
+                current_hash = file_sha256(self.resolve(record.relative_path))
+            except (OSError, ValueError):
+                return "expired"
+            if hashes.get(record.id) != current_hash:
+                return "expired"
+        if not roi_hash:
+            return "legacy"
+        import hashlib
+        import json as _json
+        encoded = _json.dumps(roi_configuration_payload(self.project.rois), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        current_roi_hash = hashlib.sha256(encoded).hexdigest()
+        return "current" if current_roi_hash == roi_hash else "expired"
 
 
 def nearest_surrounding_roi_id(rois: list[ROI], bone_roi: ROI) -> str | None:

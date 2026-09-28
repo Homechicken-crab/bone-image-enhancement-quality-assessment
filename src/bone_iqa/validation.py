@@ -38,7 +38,7 @@ def validate_project(store: ProjectStore) -> list[ValidationIssue]:
             issues.append(ValidationIssue("error", "invalid_roi_size", roi.id, f"ROI“{roi.name}”尺寸必须大于零"))
         if roi.x < 0 or roi.y < 0 or roi.x + roi.width > original.width or roi.y + roi.height > original.height:
             issues.append(ValidationIssue("error", "roi_out_of_bounds", roi.id, f"ROI“{roi.name}”超出原图边界"))
-        if roi.type in {"weak_bone", "strong_bone"}:
+        if roi.type == "weak_bone":
             pair = next((item for item in project.rois if item.id == roi.paired_surrounding_roi_id), None)
             if pair is None or pair.type != "surrounding":
                 issues.append(ValidationIssue("warning", "missing_surrounding_pair", roi.id, f"Bone ROI“{roi.name}”没有有效的 Surrounding 配对"))

@@ -287,12 +287,11 @@ Local CNR 回答：在该骨骼区域及其直接周围的局部灰度波动下�
 - `background`
 - `local`
 
-新建项目默认值为 `local`，用于选择 Background-based CNR 或 Local CNR 作为主 CNR 类型；已有项目继续使用 `project.json` 中保存的配置，不强制改变。总体主 CNR 的 ROI 聚合范围固定为 Weak Bone ROI，即：
+历史项目仍保留 `primary_cnr` 配置字段以兼容旧 JSON，但新版界面不再提供 Local / Background 切换。一次评价始终同时保存两类 CNR，且总体聚合范围固定为 Weak Bone ROI，即：
 
-- `primary_cnr = weak_bone_mean_cnr_background`，或
-- `primary_cnr = weak_bone_mean_cnr_local`
+- 旧版 `primary_cnr` 可能指向 `weak_bone_mean_cnr_background` 或 `weak_bone_mean_cnr_local`；新版总表直接并列显示两者。
 
-`all_bone_mean_cnr_*` 和 `strong_bone_mean_cnr_*` 作为辅助结果保留。主 CNR 类型设置不改变底层计算，也不删除另一类 CNR。后续可依据真实实验结果修改默认类型。
+`all_bone_mean_cnr_*` 和 `strong_bone_mean_cnr_*` 作为辅助结果保留。旧配置字段不改变底层计算，也不删除另一类 CNR。
 
 ## 10. Average Gradient
 
@@ -585,8 +584,8 @@ SSIM 不计算相对原图变化百分比，只保存 `ssim` 和 `1 - ssim`。
 | 字段 | 含义 |
 |---|---|
 | `scheme_name` | 原图或算法方案名称 |
-| `primary_cnr` | 当前配置选择的 Weak Bone Mean CNR |
-| `primary_cnr_change_percent` | 主 CNR 相对原图变化 |
+| `primary_cnr` | 兼容旧评价结果的 Local CNR 主值字段；新版总表不再单独使用 |
+| `primary_cnr_change_percent` | 兼容旧评价结果的 Local CNR 变化字段 |
 | `weak_bone_mean_cnr_background` | Weak Bone ROI 的 Background-based CNR 均值 |
 | `weak_bone_mean_cnr_local` | Weak Bone ROI 的 Local CNR 均值 |
 | `all_bone_mean_cnr_background` | 全部有效 Bone ROI 的 Background-based CNR 辅助均值 |
@@ -711,7 +710,7 @@ SSIM 不计算相对原图变化百分比，只保存 `ssim` 和 `1 - ssim`。
 
 仅修改方案显示名称时不必重新计算指标，但导出结果必须更新名称。
 
-更改 `primary_cnr` 只影响展示时，不要求重新计算，因为两类 CNR 始终已经保存。
+旧版本更改 `primary_cnr` 只影响展示；新版不提供该切换，并在一次评价中同时保存两类 CNR。
 
 ## 23. 第一阶段测试基线
 
@@ -788,7 +787,7 @@ SSIM 不计算相对原图变化百分比，只保存 `ssim` 和 `1 - ssim`。
 1. 同时保存 Background-based CNR 和 Local CNR。
 2. Background-based CNR 使用多个 Background ROI 的合并内部方差。
 3. Local CNR 使用 Bone 和对应 Surrounding ROI 方差的均方合成。
-4. 新项目默认主 CNR 类型为 Local CNR，总体主值使用 Weak Bone Mean；Background-based、All Bone Mean 和 Strong Bone Mean 作为完整辅助结果保留。
+4. 新版总体表并列显示 Weak Bone Mean Local CNR 与 Background CNR；All Bone Mean 和 Strong Bone Mean 作为完整辅助结果保留。旧 `primary_cnr` 字段仅用于兼容。
 5. Strong Bone ROI 使用默认 98% 灰度上限阈值计算 Saturation Ratio。
 6. 饱和变化默认以百分点而非相对百分比展示。
 7. 总体清晰度主指标使用 Weak Bone Mean Average Gradient；Global AG 和 Strong Bone Mean AG 作为辅助结果。
