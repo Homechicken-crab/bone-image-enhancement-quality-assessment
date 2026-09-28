@@ -1,3 +1,4 @@
+import inspect
 import unittest
 
 from bone_iqa.app import (
@@ -27,6 +28,14 @@ class UiRevisionTest(unittest.TestCase):
 
     def test_thumbnail_cell_uses_portrait_fit_area(self):
         self.assertEqual(SUMMARY_THUMBNAIL_SIZE, (60, 96))
+
+    def test_summary_rows_and_canvas_windows_keep_fixed_total_width(self):
+        add_row_source = inspect.getsource(MetricSummaryTable.add_row)
+        init_source = inspect.getsource(MetricSummaryTable.__init__)
+        self.assertIn("width=self.total_width", add_row_source)
+        self.assertIn("self.body_inner.columnconfigure(0, minsize=self.total_width", init_source)
+        self.assertIn("self.header_canvas.itemconfigure(self.header_window, width=self.total_width)", init_source)
+        self.assertIn("self.body_canvas.itemconfigure(self.body_window, width=self.total_width)", init_source)
 
     def test_diagnostic_is_specific_to_selected_scheme(self):
         app = object.__new__(BoneIQAApp)

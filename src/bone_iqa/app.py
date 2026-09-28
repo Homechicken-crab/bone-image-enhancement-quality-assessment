@@ -168,11 +168,14 @@ class MetricSummaryTable:
         self.xscroll.grid(row=2, column=0, sticky="ew")
         self.header_inner = ttk.Frame(self.header_canvas)
         self.body_inner = ttk.Frame(self.body_canvas)
-        total_width = sum(width for _heading, width in self.COLUMNS)
-        self.header_inner.configure(width=total_width)
-        self.body_inner.configure(width=total_width)
+        self.total_width = sum(width for _heading, width in self.COLUMNS)
+        self.header_inner.configure(width=self.total_width)
+        self.body_inner.configure(width=self.total_width)
+        self.body_inner.columnconfigure(0, minsize=self.total_width, weight=0)
         self.header_window = self.header_canvas.create_window((0, 0), window=self.header_inner, anchor="nw")
         self.body_window = self.body_canvas.create_window((0, 0), window=self.body_inner, anchor="nw")
+        self.header_canvas.itemconfigure(self.header_window, width=self.total_width)
+        self.body_canvas.itemconfigure(self.body_window, width=self.total_width)
         self.header_inner.bind("<Configure>", self._update_scrollregions, add="+")
         self.body_inner.bind("<Configure>", self._update_scrollregions, add="+")
         self.body_canvas.bind("<Configure>", self._body_configure, add="+")
@@ -223,7 +226,7 @@ class MetricSummaryTable:
         self._update_scrollregions()
 
     def add_row(self, row_id: str, thumbnail, values: tuple[str, ...], compared: bool):
-        row = ttk.Frame(self.body_inner, height=110)
+        row = ttk.Frame(self.body_inner, width=self.total_width, height=110)
         row.grid(row=len(self.row_widgets), column=0, sticky="ew")
         row.grid_propagate(False)
         for index, (_heading, width) in enumerate(self.COLUMNS):
